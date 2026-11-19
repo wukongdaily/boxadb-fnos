@@ -9,6 +9,28 @@
     ]
   },
   {
+    "stepTitle": "可选：自动安装 adb（仅部分电视需要）",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "Chromecast with Google TV（4K / 2019）等设备重启后 adbd 会改用<b>随机端口</b>，本应用的「连接失败时自动切换 5555」功能需要 NAS 上安装 <b>adb</b> 与 <b>avahi-utils</b>。<br><br>其它 Android TV / 电视盒子一般<b>不需要</b>，保持默认即可。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_install_adb",
+        "label": "是否自动安装 adb？",
+        "initValue": "no",
+        "options": [
+          { "label": "不需要（普通 Android TV / 电视盒子）", "value": "no" },
+          { "label": "需要（Chromecast with Google TV 等）", "value": "yes" }
+        ],
+        "rules": [
+          { "required": true, "message": "请选择是否需要自动安装 adb" }
+        ]
+      }
+    ]
+  },
+  {
     "stepTitle": "使用须知",
     "items": [
       {

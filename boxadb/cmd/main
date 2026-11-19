@@ -14,6 +14,11 @@ for rt in nodejs_v24 nodejs_v22 nodejs; do
   fi
 done
 
+# adb 需要在可写的 HOME 下生成/保存密钥（机器上 /home/<app> 不一定存在）。
+# 统一使用应用自己的 home，避免继承到调用者的 HOME 导致密钥散落。
+export HOME="${TRIM_PKGVAR}/home"   # 固定用应用自己的数据目录，避免继承调用者的 HOME
+mkdir -p "${HOME}" 2>/dev/null || true
+
 log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
 check_process() { local pid="$1"; kill -0 "$pid" 2>/dev/null; }
 status_app() {

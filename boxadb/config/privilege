@@ -1,5 +1,3 @@
 {
-  "defaults": { "run-as": "package" },
-  "username": "boxadb",
-  "groupname": "boxadb"
+  "defaults": { "run-as": "root" }
 }

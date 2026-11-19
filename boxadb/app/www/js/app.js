@@ -32,6 +32,17 @@ function toast(msg, kind='info', ms=2800){ const el=document.createElement('div'
 let _t = null;
 async function tango() { if (!_t) _t = await import('./tango.js'); return _t; }
 
+// 连接失败后，请服务端自动发现并确保 5555 可用（最多等 15 秒；超时/出错返回 null）
+async function discoverPort(ip){
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 15000) : null;
+  try {
+    const r = await fetch(`discover?host=${encodeURIComponent(ip)}`, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined });
+    return await r.json().catch(() => null);
+  } catch { return null; }
+  finally { if (timer) clearTimeout(timer); }
+}
+
 // ── 假设备（仅 ?demo=1 预览用）─────────────────────────
 function demoDevice(ip='192.168.66.172'){ return { brand:'ONN', model:'ONN Google TV (Android 14)', android:'Android 14（SDK 34）', cpu:'Amlogic S905X4', gpu:'Mali-G31', arch:'64 位', mem:'可用 1.2 GB / 共 2.9 GB', resolution:'3840 × 2160', appCount:'18 个', uptime:'2 天 6 小时', storageText:'已用 4.1 GB / 共 11 GB（剩 6.9 GB）', storagePct:37, addr:`${ip}:5555` }; }
 const DEMO_APPS = [
@@ -76,14 +87,37 @@ async function doConnect() {
   const ip=$('#device-ip').value.trim();
   state.ip=ip; state.prefs.ip=ip; savePrefs();
   state.connecting=true; renderStatus();
+  let explained=false;   // 已经给过具体原因的提示，就不再叠加一条通用报错
   try {
     const T=await tango();
-    await T.connect({ ip });
+    try {
+      await T.connect({ ip });                     // 原有路径：能连上的电视完全不受影响
+    } catch (firstErr) {
+      // 连不上才尝试「自动准备 5555」（Android 11+ 电视重启后 adbd 会改用随机端口）
+      const info=await discoverPort(ip);
+      if(info&&info.ok&&info.repaired){
+        toast('已自动切换端口，重连中...');
+        await T.connect({ ip, port: info.port });
+      }else{
+        if(info&&info.needPair){
+          // 只有"已发现端口但未授权"才需要配对：短提示 + 闪烁按钮
+          toast('Chromecast with Google TV 首次连接请先配对（点右上角闪烁的「配对」）','warn',6000);
+          revealPairBtn(true);
+          explained=true;
+        }else if(info&&info.error){
+          // 其它情况（如无线调试没开、没装 adb）只提示，不显示配对按钮
+          // —— 这时配对也帮不上忙，用户该先按提示开启/安装
+          toast(info.error,'warn',6000); explained=true;
+        }
+        throw firstErr;
+      }
+    }
     state.device=await T.fetchDevice(ip);
     state.connected=true;
+    hidePairBtn();   // 连接成功就收起「配对」（它只是按需提示，不该常驻）
     toast(`已连接：${state.device.brand} ${state.device.model}`);
   } catch (err) {
-    toast('连接失败：'+err.message,'err',4200);
+    if(!explained) toast(err.message,'err',4200);
   } finally { state.connecting=false; renderStatus(); if (state.connected) refreshApps(); }
 }
 async function doConnectUsb() {
@@ -114,6 +148,45 @@ function bindHeader(){
   else { const p=$('#usb-panel'); if (p) p.hidden=true; }
   state.prefs=loadPrefs();
   if (state.prefs.ip) $('#device-ip').value=state.prefs.ip;
+}
+
+// ── 配对（无线调试）────────────────────────────────────
+function openPairModal(){
+  const ip=$('#device-ip').value.trim() || state.prefs.ip || '';
+  const m=$('#pair-modal'); if(!m) return;
+  m.classList.remove('hidden');
+  const b=$('#pair-btn'); if(b) b.classList.remove('blink');   // 找到入口了就停止闪烁
+  $('#pair-hint').textContent = ip ? `目标：${ip}` : '请先在上方填写盒子 IP';
+  const p=$('#pair-port'); if(p){ p.value=''; p.focus(); }
+  const c=$('#pair-code'); if(c) c.value='';
+}
+function closePairModal(){ $('#pair-modal')?.classList.add('hidden'); }
+// 默认隐藏「配对」按钮：只有连不上且原因是"无线调试/未授权"时才显示，
+// 避免对普通 Android TV 用户造成误导（他们根本不需要配对）
+function revealPairBtn(blink){ const b=$('#pair-btn'); if(b){ b.style.display=''; b.classList.toggle('blink', !!blink); } }
+function hidePairBtn(){ const b=$('#pair-btn'); if(b){ b.style.display='none'; b.classList.remove('blink'); } }
+function bindPair(){
+  $('#pair-btn')?.addEventListener('click', openPairModal);
+  $('#pair-cancel')?.addEventListener('click', closePairModal);
+  $('#pair-modal')?.addEventListener('click', e=>{ if(e.target && e.target.id==='pair-modal') closePairModal(); });
+  document.addEventListener('keydown', e=>{ if(e.key==='Escape') closePairModal(); });
+  $('#pair-submit')?.addEventListener('click', async ()=>{
+    const ip=$('#device-ip').value.trim();
+    const port=Number($('#pair-port').value.trim());
+    const code=$('#pair-code').value.trim();
+    if(!ip) return toast('请先填写盒子 IP','err');
+    if(!Number.isInteger(port) || port<=0) return toast('请填写配对端口（配对弹窗里 IP 后面的数字）','err');
+    if(!/^\d{6}$/.test(code)) return toast('配对码应为 6 位数字','err');
+    const btn=$('#pair-submit'); btn.disabled=true;
+    $('#pair-hint').textContent='正在配对…（配对弹窗要保持打开）';
+    try{
+      const r=await fetch('pair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:ip,port,code})});
+      const info=await r.json().catch(()=>null);
+      if(info&&info.ok){ toast('配对成功，正在连接…'); closePairModal(); setTimeout(doConnect,300); }
+      else { const msg=(info&&info.error)||'配对失败'; $('#pair-hint').textContent=msg; toast(msg,'err',5200); }
+    }catch(err){ $('#pair-hint').textContent='请求失败：'+err.message; }
+    finally{ btn.disabled=false; }
+  });
 }
 
 // ── 标签页 ─────────────────────────────────────────────
@@ -348,7 +421,7 @@ function showInsecureDialog(){
 
 // ── 启动 ───────────────────────────────────────────────
 function boot(){
-  bindProto(); bindHeader(); bindTabs(); bindTabsNav(); bindInstall(); bindApps(); bindRemote(); bindLog();
+  bindProto(); bindHeader(); bindPair(); bindTabs(); bindTabsNav(); bindInstall(); bindApps(); bindRemote(); bindLog();
   renderStatus();
   // ── 飞牛版钩子（由 patch-app-fnos.py 在构建期注入，桌面源码不含此段）──
   window.__boxadb = { addFiles, toast };

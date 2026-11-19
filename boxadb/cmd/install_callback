@@ -1,4 +1,32 @@
 #!/bin/bash
 # 安装后：确保服务脚本可执行
 chmod +x "${TRIM_APPDEST}/server/server.js" 2>/dev/null || true
+
+# 「连接失败时自动切换 5555」需要 adb + avahi-utils（仅在安装向导勾选「需要」时才装）
+# 说明：向导里的 field 会以同名环境变量传入（与 wizard_install_adb 一致）
+LOG="${TRIM_PKGVAR}/adb-install.log"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+if [ "${wizard_install_adb:-no}" = "yes" ]; then
+  {
+    echo "$(date '+%F %T') 开始安装 adb / avahi-utils ..."
+    # 安装前先看 adb 是否已存在：只有"由本应用带入"的才在卸载时移除，避免误删系统已有的 adb
+    if command -v adb >/dev/null 2>&1; then HAD_ADB=yes; else HAD_ADB=no; fi
+    # 记录 apt 的真实输出（失败时用于排查：没权限 / 网络 / 锁被占用 等）
+    APT_OUT=$( { timeout 240 apt-get install -y -t bookworm-backports adb avahi-utils \
+                 || timeout 240 apt-get install -y adb avahi-utils; } 2>&1 )
+    printf '%s\n' "$APT_OUT" | tail -12
+    if command -v adb >/dev/null 2>&1; then
+      echo "$(date '+%F %T') 安装成功：$(adb version 2>/dev/null | head -1)"
+      if [ "$HAD_ADB" = "no" ]; then
+        : > "${TRIM_PKGVAR}/adb-installed-by-app"
+        echo "$(date '+%F %T') 已记录：adb 由本应用安装，卸载应用时将一并移除"
+      fi
+    else
+      echo "$(date '+%F %T') 安装失败：请手动执行 apt install adb avahi-utils（或检查上面的 apt 输出）"
+    fi
+    if command -v avahi-browse >/dev/null 2>&1; then
+      echo "$(date '+%F %T') avahi-browse: $(command -v avahi-browse)"
+    fi
+  } >> "$LOG" 2>&1
+fi
 exit 0

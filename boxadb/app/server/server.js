@@ -16,6 +16,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
 const crypto = require('node:crypto');
+const { execFile } = require('node:child_process');
 
 // ── 配置（飞牛生命周期注入；本地开发可省略）──
 const conf = {
@@ -380,6 +381,176 @@ async function handleNasList(req, res, url) {
   } catch (e) { say(`naslist error: ${e.message}`); json(res, 502, { error: 'acl-check-failed' }); }
 }
 
+// ── 「自动准备 5555」───────────────────────────────────────────────────
+// 为什么需要：Android 11+ 的「无线调试」使用随机端口，电视重启后 adbd 不再监听 5555。
+// 浏览器端 ADB 引擎（ya-webadb 的 AdbDaemonTransport）没有 pairing 客户端，
+// 用不了无线调试的 TLS 配对，只能走 5555 传统模式（在电视上弹窗允许密钥）。
+// 因此这里用 mDNS 读出电视当前的无线调试端口，再调用系统 adb 把它切回 5555。
+//
+// 依赖（均为可选）：mDNS 查询用 avahi-browse；切换端口用 adb。
+// 两者缺失时不影响应用本身，只在需要自动修复时返回明确提示。
+
+function tcpOpen(host, port, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const s = net.connect({ host, port });
+    let done = false;
+    const fin = (v) => { if (done) return; done = true; try { s.destroy(); } catch {} resolve(v); };
+    s.setTimeout(timeoutMs, () => fin(false));
+    s.once('connect', () => fin(true));
+    s.once('error', () => fin(false));
+  });
+}
+
+function run(cmd, args, timeoutMs) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 1 << 20 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, code: err && err.code, stdout: String(stdout || ''), stderr: String(stderr || '') });
+    });
+  });
+}
+
+// mDNS：读电视广播的无线调试端口（_adb-tls-connect._tcp）
+async function findPortByMdns(host) {
+  const r = await run('avahi-browse', ['-rtp', '_adb-tls-connect._tcp'], 4500);
+  if (!r.ok) return null;
+  for (const line of r.stdout.split('\n')) {
+    if (!line.startsWith('=')) continue;
+    const f = line.split(';');
+    if (f.length < 10 || f[2] !== 'IPv4') continue;
+    if (f[7] !== host) continue;                       // 只匹配目标盒子 IP
+    const port = Number(f[8]);
+    if (Number.isInteger(port) && port > 0 && port < 65536) return port;
+  }
+  return null;
+}
+
+let repairing = false;
+
+// ── 「配对」：把 NAS 的 adb 密钥与电视的无线调试配对（一次性）──────────────
+// 电视：开发者选项 → 无线调试 → 使用配对码配对设备（弹窗保持打开），
+// 把弹窗里的「配对端口」和 6 位配对码填进网页即可。配对一次后由 /discover 自动维持 5555。
+
+const MAX_BODY = 4 * 1024;
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY) { reject(new Error('body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); }
+      catch (e) { reject(e); }
+    });
+    req.on('error', reject);
+  });
+}
+
+let pairing = false;
+
+async function handlePair(req, res) {
+  if (conf.adminRequired && String(req.headers['x-trim-isadmin'] || '').toLowerCase() !== 'true') {
+    return json(res, 403, { ok: false, error: '仅管理员可使用配对' });
+  }
+  let body;
+  try { body = await readJsonBody(req); }
+  catch { return json(res, 400, { ok: false, error: '请求格式错误' }); }
+
+  const host = String(body.host || '').trim();
+  const port = Number(body.port);
+  const code = String(body.code || '').trim();
+  if (!isPrivateIPv4(host)) return json(res, 400, { ok: false, error: '目标必须是私网 IPv4 地址' });
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return json(res, 400, { ok: false, error: '配对端口不合法' });
+  if (!/^\d{6}$/.test(code)) return json(res, 400, { ok: false, error: '配对码应为 6 位数字' });
+  if (pairing) return json(res, 503, { ok: false, error: '另一个配对正在进行，请稍等' });
+
+  pairing = true;
+  try {
+    say(`pair: ${host}:${port} 开始配对`);
+    const r = await run('adb', ['pair', `${host}:${port}`, code], 20000);
+    if (r.code === 'ENOENT') return json(res, 502, { ok: false, error: 'NAS 上未安装 adb' });
+    const out = (r.stdout + ' ' + r.stderr).replace(/\s+/g, ' ').trim().slice(0, 300);
+    if (!r.ok || !/Successfully paired/i.test(out)) {
+      say(`pair: 失败 ${out}`);
+      return json(res, 502, { ok: false, error: out || '配对失败' });
+    }
+    say(`pair: ${host}:${port} 配对成功`);
+    return json(res, 200, { ok: true, message: '配对成功' });
+  } catch (e) {
+    say(`pair error: ${e.message}`);
+    return json(res, 502, { ok: false, error: e.message });
+  } finally {
+    pairing = false;
+  }
+}
+
+async function handleDiscover(req, res, url) {
+  const host = url.searchParams.get('host') || '';
+  if (conf.adminRequired && String(req.headers['x-trim-isadmin'] || '').toLowerCase() !== 'true') {
+    return json(res, 403, { ok: false, error: 'bridge is restricted to fnOS administrators' });
+  }
+  if (!isPrivateIPv4(host)) {
+    return json(res, 400, { ok: false, error: 'target host must be a private IPv4 address' });
+  }
+  const t0 = Date.now();
+  const base = { host, port: conf.tunnelPort };
+
+  // 1) 已经在 5555 监听 → 直接可用，无需修复
+  if (await tcpOpen(host, conf.tunnelPort)) {
+    return json(res, 200, { ...base, ok: true, repaired: false, via: 'open', durationMs: Date.now() - t0 });
+  }
+  if (repairing) {
+    return json(res, 503, { ...base, ok: false, error: '另一个自动修复正在进行，请稍后重试' });
+  }
+  repairing = true;
+  try {
+    const found = await findPortByMdns(host);
+    if (!found) {
+      return json(res, 502, {
+        ...base, ok: false,
+        error: '仅 Chromecast with Google TV 需在开发者选项中同时开启 USB 调试和无线调试',
+      });
+    }
+    say(`discover: ${host} 无线调试端口=${found}，尝试切回 ${conf.tunnelPort}`);
+    const conn = await run('adb', ['connect', `${host}:${found}`], 8000);
+    if (conn.code === 'ENOENT') {
+      return json(res, 502, { ...base, ok: false, error: 'NAS 上没有 adb，无法自动修复（请安装 adb 后续重试）' });
+    }
+    let state = '';
+    for (let i = 0; i < 8; i++) {
+      await new Promise((r) => setTimeout(r, 800));
+      const d = await run('adb', ['devices'], 4000);
+      const line = d.stdout.split('\n').map((l) => l.trim()).find((l) => l.startsWith(`${host}:${found}`));
+      state = line ? (line.split('\t')[1] || '') : '';
+      if (state === 'device') break;
+    }
+    if (state !== 'device') {
+      return json(res, 502, {
+        ...base, ok: false, discoveredPort: found, needPair: true,
+        error: `已发现无线调试端口 ${found}，但电视还没有授权本机（这是首次使用或授权被撤销的情况）。
+请点右上角「配对」完成一次配对：电视上打开 开发者选项 → 无线调试 → 使用配对码配对设备，把端口和 6 位码填进来。`,
+      });
+    }
+    await run('adb', ['-s', `${host}:${found}`, 'tcpip', String(conf.tunnelPort)], 8000);
+    await new Promise((r) => setTimeout(r, 2000));
+    if (!(await tcpOpen(host, conf.tunnelPort))) {
+      return json(res, 502, { ...base, ok: false, discoveredPort: found, error: `已尝试切回 ${conf.tunnelPort}，但端口仍未打开` });
+    }
+    say(`discover: ${host} 已自动切回 ${conf.tunnelPort}（原端口 ${found}）`);
+    return json(res, 200, {
+      ...base, ok: true, repaired: true, via: 'mdns', discoveredPort: found, durationMs: Date.now() - t0,
+    });
+  } catch (e) {
+    say(`discover error: ${e.message}`);
+    return json(res, 502, { ...base, ok: false, error: e.message });
+  } finally {
+    repairing = false;
+  }
+}
+
 // ── HTTP 服务 ──
 const app = http.createServer((req, res) => {
   let url;
@@ -387,6 +558,8 @@ const app = http.createServer((req, res) => {
   catch { res.writeHead(400).end('bad request'); return; }
 
   if (req.method !== 'GET' && req.method !== 'HEAD') {
+    // 唯一的 POST 接口：配对（无线调试）
+    if (req.method === 'POST' && url.pathname === `${conf.prefix}/pair`) { handlePair(req, res); return; }
     res.writeHead(405).end('method not allowed');
     return;
   }
@@ -396,6 +569,7 @@ const app = http.createServer((req, res) => {
   }
   if (url.pathname === `${conf.prefix}/nasfile`) { handleNasFile(req, res, url); return; }
   if (url.pathname === `${conf.prefix}/naslist`) { handleNasList(req, res, url); return; }
+  if (url.pathname === `${conf.prefix}/discover`) { handleDiscover(req, res, url); return; }
   // 飞牛入口 url=/app/boxadb 不带斜杠：302 到规范地址，
   // 否则页面里的相对资源（css/js）会解析到 /app/ 下而全部 404。
   if (url.pathname === conf.prefix) {

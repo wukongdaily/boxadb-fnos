@@ -1,4 +1,19 @@
 #!/bin/bash
 # 卸载前：清理运行痕迹（pid / socket）
 rm -f "${TRIM_PKGVAR}/app.pid" "${TRIM_APPDEST}/app.sock" 2>/dev/null || true
+
+# 如果 adb 是「安装本应用时由向导带入的」，卸载时一并移除，避免残留冲突。
+# 只动 adb，不动 fnOS 自带的 avahi-utils；系统原本就有的 adb 也不会被删（安装时不会打标记）。
+if [ -f "${TRIM_PKGVAR}/adb-installed-by-app" ]; then
+  LOG="${TRIM_PKGVAR}/adb-install.log"
+  echo "$(date '+%F %T') 卸载：移除本应用安装的 adb ..." >> "$LOG" 2>/dev/null || true
+  pkill -x adb 2>/dev/null || true
+  sleep 1
+  apt-get remove --purge -y adb >> "$LOG" 2>&1 || true
+  if command -v adb >/dev/null 2>&1; then
+    echo "$(date '+%F %T') 卸载：adb 移除失败，请手动 apt remove --purge adb" >> "$LOG" 2>/dev/null || true
+  else
+    echo "$(date '+%F %T') 卸载：adb 已移除 ✓" >> "$LOG" 2>/dev/null || true
+  fi
+fi
 exit 0

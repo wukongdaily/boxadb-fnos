@@ -28,9 +28,9 @@ async function bridgeStream(host, port) {
   socket.binaryType = 'arraybuffer';
 
   await new Promise((resolve, reject) => {
-    const t = setTimeout(() => { try { socket.close(); } catch {} reject(new Error('桥接连接超时，请确认已运行 webadb-bridge')); }, 8000);
+    const t = setTimeout(() => { try { socket.close(); } catch {} reject(new Error('连接超时：请确认盒子已开机且与 NAS 在同一网络')); }, 8000);
     socket.onopen = () => { clearTimeout(t); resolve(); };
-    socket.onerror = () => { clearTimeout(t); reject(new Error('无法连接本地桥接：请在电脑上运行 webadb-bridge')); };
+    socket.onerror = () => { clearTimeout(t); reject(new Error('无法连接：请确认盒子已开机且与 NAS 在同一网络')); };
   });
 
   const readable = new ReadableStream({
@@ -71,7 +71,7 @@ export async function connect({ ip, port = DEFAULT_PORT } = {}) {
     );
   } catch (e) {
     closeSocket();
-    throw /auth/i.test(String(e?.message || e)) ? new Error('设备未授权：请先完成 adb tcpip 5555 并允许调试') : e;
+    throw /auth/i.test(String(e?.message || e)) ? new Error('设备未授权：请在电视上允许 USB 调试') : e;
   }
   const a = new adb.Adb(transport);
   handle = { adb: a, closeSocket };

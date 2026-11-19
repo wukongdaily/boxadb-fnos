@@ -8,6 +8,24 @@
   <link rel="icon" type="image/png" href="assets/logo.png" />
   <link rel="stylesheet" href="css/xterm.css" />
   <link rel="stylesheet" href="css/style.css" />
+  <style>
+    /* 配对弹窗（自包含样式，避免改动 style.css） */
+    .pair-modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:60;padding:20px}
+    .pair-modal.hidden{display:none}
+    .pair-card{background:var(--bg2,#1c1f26);border:1px solid var(--line,#333);border-radius:14px;padding:20px;width:min(440px,100%);color:var(--text,#eee);box-shadow:0 12px 40px rgba(0,0,0,.5)}
+    .pair-card h3{margin:0 0 8px;font-size:16px}
+    .pair-card p{margin:0 0 12px;font-size:12px;line-height:1.6}
+    .pair-card label{display:block;margin:10px 0 0;font-size:12px}
+    .pair-card input{display:block;width:100%;margin-top:6px;padding:9px 10px;border-radius:8px;border:1px solid var(--line,#3a3f4a);background:var(--bg,#14161b);color:inherit;font-size:14px;box-sizing:border-box}
+    .pair-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+    .pair-card .muted{margin-top:14px;font-size:11px;opacity:.75}
+    /* 「配对」按钮闪烁：首次使用需要配对时用来吸引注意 */
+    #pair-btn.blink{animation:pair-blink 1.1s ease-in-out infinite;border-color:var(--warn,#ffc400)!important;color:var(--warn,#ffc400)!important}
+    @keyframes pair-blink{
+      0%,100%{box-shadow:0 0 0 0 rgba(255,196,0,.65)}
+      50%{box-shadow:0 0 0 7px rgba(255,196,0,0)}
+    }
+  </style>
 </head>
 <body>
   <!-- 顶部：品牌 + 连接 + 标签导航（一起 sticky，任何面板滚动都可见） -->
@@ -33,6 +51,7 @@
         <!-- 默认隐藏：只有 Pages / 桌面版且浏览器支持 WebUSB 时，app.js 才把它亮出来。
              Docker / 飞牛自托管版永远不出现，也不会有「闪一下」的观感。 -->
         <button id="usb-toggle" type="button" class="btn subtle" hidden title="用 USB 数据线直连（需 Chrome / Edge）">🔌 USB 直连</button>
+        <button id="pair-btn" class="btn ghost" style="display:none" title="无线调试配对（仅在提示需要开启无线调试时才显示）">配对</button>
         <span id="status-pill" class="pill off">未连接</span>
       </div>
     </header>
@@ -204,6 +223,31 @@
   <footer class="foot">
     <a class="foot-link" href="https://github.com/wukongdaily/boxadb" target="_blank" rel="noopener">盒子助手 BoxADB 悟空的日常</a>
   </footer>
+
+  <!-- 配对（无线调试）弹窗 -->
+  <div id="pair-modal" class="pair-modal hidden">
+    <div class="pair-card">
+      <h3>配对电视（无线调试）</h3>
+      <p><b>仅 Chromecast with Google TV 等使用「无线调试随机端口」的设备需要这一步</b>；
+        普通 Android TV / 电视盒子一般不需要配对。<br><br>
+        在电视上打开：<b>开发者选项 → 无线调试 → 使用配对码配对设备</b>，把弹窗里的
+        <b>配对端口</b>和<b>6 位配对码</b>填到这里。<br>
+        ⚠️ 配对弹窗要保持打开，离开设置页面码就会失效。</p>
+      <label>配对端口
+        <input id="pair-port" type="text" inputmode="numeric" autocomplete="off"
+               placeholder="配对弹窗里 IP 后面的端口，如 36065" />
+      </label>
+      <label>6 位配对码
+        <input id="pair-code" type="text" inputmode="numeric" autocomplete="off" maxlength="6"
+               placeholder="如 664603" />
+      </label>
+      <div class="pair-actions">
+        <button class="btn ghost" id="pair-cancel">取消</button>
+        <button class="btn primary" id="pair-submit">开始配对</button>
+      </div>
+      <p class="muted" id="pair-hint">配对只需一次，之后会自动维持 5555。</p>
+    </div>
+  </div>
 
   <!-- 非加密访问引导弹窗（浏览器禁止 http 页面生成 ADB 密钥）-->
   <div id="insecure-modal" hidden>
