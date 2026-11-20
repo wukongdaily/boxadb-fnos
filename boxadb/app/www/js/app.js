@@ -1,11 +1,13 @@
 'use strict';
 import * as BoxTerm from './terminal.js';
 import * as Icons from './icons.js';
+// 诊断数据出口：app.js 不直接 import tango（它是懒加载的），这里挂一个取数函数
+let __diagGetter = null; window.__boxadbDiag = () => (__diagGetter ? __diagGetter() : Promise.resolve({}));
 
-// 自托管形态（Docker / 飞牛应用）由服务端在 index.html 注入这个 meta。
-// 该形态下桥跑在 NAS 上，「USB 直连」连的是打开网页那台电脑的 USB，
-// 与「远端桥走网络」的定位冲突，所以整个入口不渲染；Pages / 桌面版才显示。
+// 自托管形态（Docker / 飞牛）由服务端注入该 meta；此形态下桥在 NAS 上，USB 入口不渲染。
 const SELF_HOSTED = true;  // 飞牛=NAS 应用，永不自助 USB；此常量由 patch-app-fnos.py 钉死
+// 诊断面板：只有 URL 带 ?diag=1 才出现，正常使用时界面里完全看不到
+const DIAG = typeof location !== 'undefined' && location.search.includes('diag=1');
 
 const state = {
   connected: false,
@@ -30,7 +32,7 @@ function toast(msg, kind='info', ms=2800){ const el=document.createElement('div'
 
 // ── 惰性加载传输层 ─────────────────────────────────────
 let _t = null;
-async function tango() { if (!_t) _t = await import('./tango.js'); return _t; }
+async function tango() { if (!_t) { _t = await import('./tango.js'); if (_t.getDiag) __diagGetter = () => _t.getDiag(); } return _t; }
 
 // ── 假设备（仅 ?demo=1 预览用）─────────────────────────
 function demoDevice(ip='192.168.66.172'){ return { brand:'ONN', model:'ONN Google TV (Android 14)', android:'Android 14（SDK 34）', cpu:'Amlogic S905X4', gpu:'Mali-G31', arch:'64 位', mem:'可用 1.2 GB / 共 2.9 GB', resolution:'3840 × 2160', appCount:'18 个', uptime:'2 天 6 小时', storageText:'已用 4.1 GB / 共 11 GB（剩 6.9 GB）', storagePct:37, addr:`${ip}:5555` }; }
@@ -82,9 +84,146 @@ async function doConnect() {
     state.device=await T.fetchDevice(ip);
     state.connected=true;
     toast(`已连接：${state.device.brand} ${state.device.model}`);
+    renderDiag();
   } catch (err) {
+    renderDiag();
+    // 端口不对的两种表现都要给一次机会：A=5555 没人监听，C=有应答但不是明文 ADB
+    if (err && (err.code === 'NEED_PORT' || err.code === 'BRIDGE_UNREACHABLE')) {
+      if (await autoRecover(ip)) return;          // 以前配过对：静默把端口钉回来，不打扰用户
+      showPortDialog(ip, err.code); return;
+    }
     toast('连接失败：'+err.message,'err',4200);
   } finally { state.connecting=false; renderStatus(); if (state.connected) refreshApps(); }
+}
+
+// ── 把调试端口固定回 5555：先试已存凭据自愈，不行再让用户填电视上的两屏 ──
+async function autoRecover(ip) {
+  if (!(await pairAvailable())) return false;
+  try {
+    const T = await tango();
+    const r = await T.recoverWireless(ip);
+    if (!r || !r.ok) { if (r && r.need === 'enable-wireless') needsWirelessOn(r.hint); return false; }
+  } catch { return false; }
+  try {
+    toast('检测到这台设备以前配过对，正在自动恢复…');
+    const T = await tango();
+    await T.connect({ ip });
+    state.device = await T.fetchDevice(ip); state.connected = true;
+    renderDiag();
+    toast('已自动连上，不用重新配对');
+    return true;
+  } catch { return false; }
+}
+
+// 桥说「没发现无线调试服务」＝十有八九是盒子刚重启，开关自己关了；这种别让用户去输配对码
+function needsWirelessOn(hint) {
+  if (!hint) return;
+  toast(hint, 'warn', 12000);
+}
+
+// stall 分两类：有来文＝在等你点「允许」（显示状态块，别报失败）；完全没来文＝疑似 TLS 配对端口
+function handleStall(why, { stall, m }) {
+  if (why === 'await-allow') {
+    const allow = $('#pair-allow');
+    if (m && !m.hidden && allow) { allow.hidden = false; allow.scrollIntoView({ block: 'nearest' }); }
+    toast('设备已应答，正在等你在电视上点「允许 USB 调试」…', 'warn', 9000);
+    return;
+  }
+  if (stall && m && !m.hidden) stall.hidden = false;
+  toast('这个端口没有任何响应，可能是需要无线调试配对的设备…', 'warn', 6000);
+}
+
+let pairCap = null;
+async function pairAvailable() {
+  if (!SELF_HOSTED) return false;
+  if (pairCap === null) { try { pairCap = await (await tango()).wirelessAvailable(); } catch { pairCap = false; } }
+  return pairCap;
+}
+
+async function showPortDialog(ip, reason){
+  const m=$('#port-modal'); if(!m) return;
+  const title=$('#port-title'), desc=$('#port-desc');
+  const inp=$('#port-input'), hint=$('#port-modal-ip'), ok=$('#port-ok'), cancel=$('#port-cancel');
+  const pinp=$('#pair-port-input'), cinp=$('#pair-code-input');
+  const pg=$('#pair-group'), det=$('#port-detect'), note=$('#pair-note');
+  const canPair = await pairAvailable();
+  if (pg) pg.hidden = !canPair;
+  if (det) det.hidden = !canPair;
+  if (note) note.hidden = !canPair;
+  if(title) title.textContent = reason === 'NEED_PORT' ? '这个端口不接受明文连接，需要配对' : '这台设备的 5555 端口没有反应';
+  if(desc) desc.innerHTML = reason === 'NEED_PORT'
+    ? '端口上确实有服务，但它是安卓 11+「无线调试」的加密端口。把<b>第二屏</b>的配对端口和 6 位配对码填到 ②，我配完对会<b>自动固定成 5555</b>；以后重启也只要开着无线调试就行。'
+    : '多数是重启后调试端口变成了随机值（安卓 11 以上的电视常见）。填 ① 就能连；要是提示需要配对，再补 ②。我连上后会<b>自动固定成 5555</b>，以后只填 IP 就能连。';
+  if(hint) hint.textContent = ip;
+  if(inp) inp.value = (state.prefs.ports && state.prefs.ports[ip]) || '';
+  if(pinp) pinp.value = '';
+  if(cinp) cinp.value = '';
+  if(ok) ok.textContent = canPair ? '连接并固定端口' : '连接并固定端口';
+  const stall=$('#port-stall'); if(stall) stall.hidden = true;
+  m.hidden=false;
+  const first = canPair && !(inp && inp.value) ? inp
+    : (canPair && cinp && !cinp.value ? cinp : inp);
+  if (first) setTimeout(()=>first.focus(), 60);
+  if(cancel) cancel.onclick=()=>{ m.hidden=true; };
+  if(det) det.onclick=async ()=>{
+    det.disabled=true; const t0=det.textContent; det.textContent='查找中…';
+    try{
+      const T=await tango(); const d=await T.discoverWireless();
+      const c=(d.connect||[])[0], pp=(d.pairing||[])[0];
+      if(c&&inp&&!inp.value) inp.value=c.port;
+      if(pp&&pinp) pinp.value=pp.port;
+      toast(c ? `已自动填入：连接端口 ${c.port}${pp ? '、配对端口 ' + pp.port : ''}${c.paired ? '（这台配过对，② 留空即可）' : ''}` : '没查到无线调试广播：请确认电视上「无线调试」已打开，或手填端口');
+    }catch(e){ toast('自动查找失败：'+(e&&e.message||e),'err',6000); }
+    finally{ det.disabled=false; det.textContent=t0; }
+  };
+  if(!ok) return;
+  ok.onclick=async ()=>{
+    const port=Number((inp && inp.value || '').trim());
+    const pairPort=Number((pinp && pinp.value || '').trim());
+    const code=(cinp && cinp.value || '').trim();
+    const wantPair = canPair && (pairPort>0 || code.length>0);
+    if (wantPair){
+      if(!(Number.isInteger(pairPort)&&pairPort>0&&pairPort<=65535)){ toast('配对端口请填 1-65535 的数字','warn'); return; }
+      if(!/^\d{6}$/.test(code)){ toast('配对码是 6 位数字（电视第二屏上那串）','warn'); return; }
+    } else if(!Number.isInteger(port) || port<1 || port>65535){ toast('端口请填 1-65535 的数字','warn'); return; }
+    ok.disabled=true; ok.textContent='处理中…';
+    const stall=$('#port-stall');
+    try{
+      const T=await tango();
+      if (wantPair){
+        const r=await T.pairWireless({ host:ip, pairPort, code, connPort:(Number.isInteger(port)&&port>0)?port:undefined });
+        if (r.need==='conn-port') { toast('配对成功了，但没找到连接端口：请把 ① 的端口填上再提交一次','warn',8000); if(stall) stall.hidden=true; return; }
+        if (!r.pinned) toast(r.hint || '已配对，但端口没固定成功，正在尝试直接连接','warn',7000);
+      } else {
+        await T.connect({ ip, port, onStall: (why) => handleStall(why, { stall, m }) });
+        await T.enableTcpip(5555);
+        await T.disconnect();
+      }
+      // 首次用本页面的钥匙连 5555，设备会弹「允许 USB 调试」：这不是失败，等用户点即可（给足 90 秒）
+      await T.connect({ ip, authTimeoutMs: 90000, onStall: (why) => handleStall(why, { stall, m }) });
+      state.device=await T.fetchDevice(ip); state.connected=true;
+      if (!wantPair) state.prefs.ports = Object.assign({}, state.prefs.ports, { [ip]: port });
+      savePrefs();
+      m.hidden=true;
+      toast('已固定为 5555。第一次连本页面时电视会弹「允许 USB 调试」，点允许即可', '', 9000);
+      renderDiag();
+      const allow=$('#pair-allow'); if (allow) allow.hidden = true;
+    }catch(err){
+      renderDiag();
+      const msg = err && err.message ? err.message : String(err);
+      if (/还在等电视|允许 USB 调试/.test(msg)) { toast(msg, 'warn', 12000); ok.textContent='我点过允许了，再连一次'; ok.disabled=false; return; }
+      if (err && (err.code==='code'||err.step==='code')) toast('配对码不对或已过期：回到电视那个窗口，重新抄一遍 6 位码','err',8000);
+      else if (err && (err.code==='tls'||err.code==='cnxn')) toast('这台设备的配对已失效，请重新开一次配对窗口','err',8000);
+      else if (err && err.code==='plaintext') toast('这台设备不需要配对：直接填 IP 连接即可','warn',7000);
+      else if (err && err.code==='pair-tls') toast('连不上配对端口：请确认电视上的配对窗口还开着，端口抄的是第二屏那个','err',8000);
+      else if (err && err.code==='NEED_PORT') toast('这个端口也连不上：请确认填的是电视上当前显示的端口','err',7000);
+      else toast('还是没成功：'+msg,'err',6500);
+      ok.textContent='再试一次';
+    }finally{
+      ok.disabled=false;
+      state.connecting=false; renderStatus(); if(state.connected) refreshApps();
+    }
+  };
 }
 async function doConnectUsb() {
   if (state.demo) return;
@@ -109,11 +248,29 @@ function bindHeader(){
   const ut=$('#usb-toggle'); if (ut) ut.addEventListener('click', ()=>{ const p=$('#usb-panel'); if (p) p.hidden=!p.hidden; });
   const ub=$('#connect-usb-btn'); if (ub) ub.addEventListener('click', doConnectUsb);
   const uc=$('#usb-close'); if (uc) uc.addEventListener('click', ()=>{ const p=$('#usb-panel'); if (p) p.hidden=true; });
-  // HTML 里默认 hidden：仅 Pages / 桌面版 + 浏览器支持 WebUSB 才显示；自托管永不显示
+  // HTML 默认 hidden：Pages / 桌面版且浏览器支持 WebUSB 时才显示
   if (!SELF_HOSTED && navigator.usb) { const t=$('#usb-toggle'); if (t) t.hidden=false; }
   else { const p=$('#usb-panel'); if (p) p.hidden=true; }
   state.prefs=loadPrefs();
   if (state.prefs.ip) $('#device-ip').value=state.prefs.ip;
+}
+
+// ── 诊断面板（?diag=1）：把连不上的原因分成 A/B/C/D/E 五类显示出来 ──
+function renderDiag(){
+  if (!DIAG) return;
+  const box = $('#diag'); if (!box) return;
+  box.hidden = false;
+  const T = window.__boxadbDiag;
+  Promise.resolve(T && T()).then(d => {
+    const lines = [
+      '桥地址：' + (d.bridge || '—'),
+      '目标：' + (d.target || '未发起'),
+      '分类：' + (d.kind || '—'),
+      '原文：' + (d.detail || '—'),
+      '固定端口(tcpip)：' + (d.tcpip || '未执行'),
+    ];
+    box.textContent = lines.join('\n');
+  }).catch(() => { box.textContent = '诊断数据读取失败'; });
 }
 
 // ── 标签页 ─────────────────────────────────────────────
@@ -293,8 +450,8 @@ function seedDemo(){ state.demo=true; state.connected=true; state.device=demoDev
 
 // ── 非加密访问引导（浏览器禁止 http 页面生成 ADB 密钥）────────
 // 计算最可能的 https 地址：飞牛默认 5666(http)→5667(https)；http 默认端口→https 默认端口；其余端口原样保留
-// 飞牛网关路径（/app/xxx）统一跳「桌面主页」：应用窗口的开关由飞牛桌面自己负责，
-// 我们无法用 URL 让它在原窗口里重开（飞牛没有对外的深链），跳主页最一致、也把整个飞牛迁到加密源
+// 飞牛网关路径（/app/xxx）统一跳桌面主页：飞牛没有可直达应用窗口的深链，
+// 窗口开关由桌面自己负责，跳主页最一致
 function insecureFixUrl(){
   try{
     const u=new URL(location.href);
@@ -308,17 +465,15 @@ function insecureFixUrl(){
 }
 function showInsecureDialog(){
   const m=$('#insecure-modal'); if(!m) return;
-  // 两套引导按「服务是否自带 https 端口」分流，不能复用 SELF_HOSTED：
-  //   · 自托管 Go 桥（Docker / NAS 容器）会注入 boxadb-tls-port → 一键切到自己的 https
-  //   · 飞牛走统一网关、没有自带端口（加密入口是 5667）→ 显示「打开飞牛加密主页」
-  // SELF_HOSTED 只管 WebUSB 入口门控：飞牛同样是自托管形态，但两套引导文案完全不同。
+  // 两套引导按「服务是否自带 https 端口」分流（不能复用 SELF_HOSTED）：
+  //   有 boxadb-tls-port（Docker/NAS 容器）→ 一键切自己的 https；
+  //   没有（飞牛网关，加密入口是 5667）→ 走「打开飞牛加密主页」
   const tlsPort=(document.querySelector('meta[name="boxadb-tls-port"]')?.content||'').trim();
   const ownTls=/^\d{2,5}$/.test(tlsPort);
   const fnosBox=$('#insecure-fnos'), selfBox=$('#insecure-selfhost');
   if(fnosBox) fnosBox.hidden = ownTls || !SELF_HOSTED;
   if(selfBox) selfBox.hidden = !ownTls;
 
-  // 自带 https 端口时才给一键跳转（桌面 Pages 两个 meta 都没有，按钮自然隐藏）
   const httpsUrl=ownTls
     ? `https://${location.hostname}:${tlsPort}${location.pathname}${location.search}` : '';
   const tbtn=$('#insecure-tls'), turl=$('#insecure-tls-url');
@@ -335,9 +490,8 @@ function showInsecureDialog(){
   const b=$('#insecure-fix');
   if(b) b.onclick=()=>{
     if(!url){ toast('无法自动计算地址，请手动修改','warn'); return; }
-    // 顶层打开：直接跳转
     if (window.self === window.top) { location.replace(url); return; }
-    // iframe 内（飞牛桌面）：必须开新标签——自签证书警告只在整页才能点「继续访问」，iframe 里点了也过不去
+    // iframe 内（飞牛桌面）必须开新标签：自签证书警告只在整页可点「继续访问」
     const w=window.open(url, '_blank', 'noopener');
     if(!w){ toast('浏览器拦住了新标签：请手动把地址里的 http:// 改成 https://、端口 5666 改成 5667','err',8000); return; }
     toast('已打开飞牛加密主页：证书提示页点「高级 → 继续访问」，然后在桌面重新点开「盒子助手」','info',8000);

@@ -3,11 +3,9 @@ import * as stream from './vendor/stream-extra.js';
 import CredentialStore from './vendor/adb-credential-web.js';
 import { unzipSync } from './vendor/fflate.js';
 
-// 桥地址：GitHub Pages 场景固定连本机 127.0.0.1:8765（不给用户填）。
-// 自托管形态（NAS/Docker，网页由桥自己发出）改为同源 + 前缀，前缀由服务端在
-// index.html 运行时注入，前端不做任何构建期改写：
-//   <meta name="boxadb-mode" content="selfhosted">
-//   <meta name="boxadb-prefix" content="/app/boxadb">   容器形态为空
+// 桥地址：Pages 场景固定连本机 127.0.0.1:8765。
+// 自托管形态（NAS/Docker）改为同源 + 前缀，前缀由服务端运行时注入，前端无构建期改写：
+//   <meta name="boxadb-mode" content="selfhosted"> + <meta name="boxadb-prefix" ...>（容器为空）
 export const selfHosted = typeof document !== 'undefined'
   && document.querySelector('meta[name="boxadb-mode"]')?.content === 'selfhosted';
 const bridgePrefix = typeof document !== 'undefined'
@@ -16,9 +14,19 @@ export const BRIDGE_BASE = selfHosted
   ? `${location.protocol}//${location.host}${bridgePrefix}`
   : 'http://127.0.0.1:8765';
 const DEFAULT_PORT = 5555;                            // 固定端口，不进输入框
+// 连不上时的提示按形态给：NAS/Docker 版根本没有「电脑上的桥接程序」这回事
+const bridgeHint = selfHosted
+  ? '请确认盒子已开机、与 NAS 在同一网络，并已开启网络调试'
+  : '请确认电脑上的桥接程序正在运行（窗口别关），且盒子与本机在同一网络';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 let handle = null; // { adb, closeSocket }
+
+// 连接诊断：把「连不上」拆成浏览器侧能确定的四种情况，供 ?diag=1 面板显示。
+// 依据是 WS 隧道有没有建立：没建立=端口没人监听/桥不可达；建立了但 adbd 立刻断开=
+// 那个端口跑的是 TLS（无线调试）或不是 adbd。
+const diag = { bridge: BRIDGE_BASE, target: '', kind: '', detail: '', tcpip: '' };
+export function getDiag() { return Object.assign({}, diag); }
 
 // ── 把 WebSocket 字节流包成 ADB 的包流 ───────────────
 async function bridgeStream(host, port) {
@@ -26,17 +34,18 @@ async function bridgeStream(host, port) {
     `/adb?host=${encodeURIComponent(host)}&port=${port}`;
   const socket = new WebSocket(wsUrl);
   socket.binaryType = 'arraybuffer';
+  let inbound = 0;                       // 入向字节：有来文＝adbd 在说话（多半是 AUTH，等用户点允许）
 
   await new Promise((resolve, reject) => {
-    const t = setTimeout(() => { try { socket.close(); } catch {} reject(new Error('桥接连接超时，请确认已运行 webadb-bridge')); }, 8000);
-    socket.onopen = () => { clearTimeout(t); resolve(); };
-    socket.onerror = () => { clearTimeout(t); reject(new Error('无法连接本地桥接：请在电脑上运行 webadb-bridge')); };
+      const t = setTimeout(() => { try { socket.close(); } catch {} const e = new Error('连接超时：' + bridgeHint); e.code = 'BRIDGE_TIMEOUT'; reject(e); }, 8000);
+      socket.onopen = () => { clearTimeout(t); resolve(); };
+      socket.onerror = () => { clearTimeout(t); const e = new Error('无法连接：' + bridgeHint); e.code = 'BRIDGE_UNREACHABLE'; reject(e); };
   });
 
   const readable = new ReadableStream({
     start(c) {
       socket.onmessage = e => {
-        if (e.data instanceof ArrayBuffer) c.enqueue(new Uint8Array(e.data));
+        if (e.data instanceof ArrayBuffer) { inbound += e.data.byteLength; c.enqueue(new Uint8Array(e.data)); }
         else c.error(new Error('桥接返回了非二进制数据'));
       };
       socket.onerror = () => c.error(new Error('桥接连接错误'));
@@ -55,24 +64,62 @@ async function bridgeStream(host, port) {
       readable: readable.pipeThrough(new stream.StructDeserializeStream(adb.AdbPacket)),
       writable: stream.pipeFrom(writable, new adb.AdbPacketSerializeStream()),
     },
+    inbound: () => inbound,
     closeSocket: () => { try { socket.close(); } catch {} },
   };
 }
 
 // ── 连接（含 RSA 认证；首次要在盒子上允许调试）────────
-export async function connect({ ip, port = DEFAULT_PORT } = {}) {
+export async function connect({ ip, port = DEFAULT_PORT, onStall, authTimeoutMs = 30000, stallMs = 8000 } = {}) {
   if (!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip || '')) throw new Error('请输入合法 IPv4，如 192.168.66.157');
-  const { connection, closeSocket } = await bridgeStream(ip, port);
+  diag.target = ip + ':' + port; diag.kind = ''; diag.detail = ''; diag.tcpip = '';
+  let stream;
+  try {
+    stream = await bridgeStream(ip, port);
+  } catch (e) {
+    diag.kind = e && e.code === 'BRIDGE_TIMEOUT' ? 'A-桥/端口无响应' : 'A-端口没人监听';
+    diag.detail = String(e && e.message || e);
+    throw e;
+  }
+  const { connection, closeSocket } = stream;
   let transport;
   try {
-    transport = await withTimeout(
-      adb.AdbDaemonTransport.authenticate({ serial: `${ip}:${port}`, connection, credentialStore: new CredentialStore('boxadb') }),
-      30000, '连接超时：请在盒子上允许 ADB 调试后重试'
-    );
+    // 认证本身最长等 30 秒（盒子弹窗要点允许）；但 8 秒内一个 ADB 报文都没有，
+    // 几乎可以断定对端在等 TLS ClientHello —— 先给用户一句人话，别让他干等。
+    const auth = adb.AdbDaemonTransport.authenticate({ serial: `${ip}:${port}`, connection, credentialStore: new CredentialStore('boxadb') });
+    const first = await Promise.race([
+      auth.then(() => 'ok', () => 'err'),
+      new Promise(r => setTimeout(() => r('stall'), stallMs)),
+    ]);
+    // 关键区分：8 秒没结果，但期间**有报文往来** = adbd 已发了 AUTH、正等用户在盒子上点「允许」，
+    // 这不是 TLS 端口、更不是失败；只有完全没来文才像 TLS 配对端口。
+    if (first === 'stall') {
+      if (stream.inbound && stream.inbound() > 0) {
+        diag.kind = 'D-明文可达，等盒子授权';
+        diag.detail = `已收到 ${stream.inbound()} 字节：设备在等用户点「允许 USB 调试」`;
+        if (onStall) { try { onStall('await-allow'); } catch {} }
+      } else {
+        diag.kind = 'C-端口无响应（疑似 TLS 配对端口）';
+        diag.detail = `${stallMs / 1000} 秒内没有任何 ADB 报文：对端在等 TLS 握手，明文进不去`;
+        if (onStall) { try { onStall('tls'); } catch {} }
+      }
+    }
+    transport = await withTimeout(auth, authTimeoutMs, '还在等电视上的「允许 USB 调试」：点完允许再按一次连接即可');
   } catch (e) {
     closeSocket();
-    throw /auth/i.test(String(e?.message || e)) ? new Error('设备未授权：请先完成 adb tcpip 5555 并允许调试') : e;
+    const m = String(e?.message || e);
+    if (/auth/i.test(m)) { diag.kind = 'D-明文可达，等盒子授权'; diag.detail = m; throw new Error('设备未授权：请在电视/盒子上点「允许 USB 调试」（勾上一律允许）后重试'); }
+    // adbd 应答一下就断开：典型是端口上跑的是无线调试（TLS）而不是明文 ADB，或根本没开 5555
+    if (/connection closed unexpectedly/i.test(m)) {
+      diag.kind = 'C-端口只接受 TLS（无线调试配对类）'; diag.detail = m;
+      const err = new Error('这台设备没在 5555 上监听'); err.code = 'NEED_PORT'; throw err;
+    }
+    // 其它断开类错误（配对端口常见）也按 TLS 处理，但原文照记，便于继续归类
+    diag.kind = /closed|reset|EOF|unexpected/i.test(m) ? 'C-端口拒绝明文（配对端口常见）' : 'E-其它';
+    diag.detail = m;
+    throw e;
   }
+  diag.kind = 'B-已连上（明文 ADB 可达）'; diag.detail = '';
   const a = new adb.Adb(transport);
   handle = { adb: a, closeSocket };
   _sdk = null;   // 换设备复位 SDK 缓存
@@ -134,6 +181,42 @@ export async function deviceSdk() {
     _sdk = parseInt(s, 10) || 0;
   } catch { _sdk = 0; }
   return _sdk;
+}
+
+// 让 adbd 自己切到固定端口（等价于电脑上的 adb tcpip 5555）：
+// 走已建立的 ADB 通道，不需要 adb 二进制、不需要 root、不需要电脑参与。
+// ── 无线调试配对：浏览器拿不到 TLS 客户端证书与导出密钥，只有桥能做 ──
+export const wirelessSupported = selfHosted;
+async function api(path, body) {
+  const init = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined;
+  const r = await fetch(BRIDGE_BASE + path, init);
+  const d = await r.json().catch(() => ({}));
+  if (d && d.error) { const e = new Error(d.hint || d.error); e.code = d.error; e.step = d.error; throw e; }
+  if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+  return d;
+}
+export const discoverWireless = () => api('/discover');
+let wirelessProbe = null;
+export function wirelessAvailable() {              // 桥是否实现了配对接口（Go 桥没有 → 界面不出配对口）
+  if (!selfHosted) return Promise.resolve(false);
+  if (!wirelessProbe) wirelessProbe = discoverWireless().then(() => true).catch(() => false);
+  return wirelessProbe;
+}
+export const pairWireless = (o) => api('/pair', o);
+export const recoverWireless = (host) => api('/recover', { host });
+
+export async function enableTcpip(port = DEFAULT_PORT) {
+  const a = requireAdb();
+  try {
+    const r = await (a.tcpip && a.tcpip.enable ? a.tcpip.enable(port) : rawTcpip(a, port));
+    diag.tcpip = '✓ adbd 应答：' + String(r).trim();
+    return r;
+  } catch (e) { diag.tcpip = '✗ 失败：' + String(e && e.message || e); throw e; }
+}
+async function rawTcpip(a, port) {
+  const out = await a.createSocketAndWait(`tcpip:${port}`);
+  if (!/restarting in TCP mode/i.test(String(out))) throw new Error(String(out || '切换失败'));
+  return out;
 }
 
 // ── 底层：跑一条一次性 shell，返回文本输出 ──────────────
@@ -333,7 +416,7 @@ async function parsePackage(file) {
   throw new Error('不支持的文件类型（仅支持 .apk / .xapk / .apkm）');
 }
 
-// ── 安装错误人话化：把厂商限制 / 常见 INSTALL_FAILED_* 翻成中文指引 ──
+// ── 把 INSTALL_FAILED_* / 厂商限制翻成中文指引 ──
 export function friendlyInstallError(raw) {
   const s = String(raw || '');
   if (/install_switch_flag|disabled .*from pm|by system default|not allowed to install|install .*disabled/i.test(s))

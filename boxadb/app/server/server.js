@@ -15,7 +15,11 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
+const os = require('node:os');
 const crypto = require('node:crypto');
+const mdns = require('./pair/mdns.js');
+const keystore = require('./pair/keystore.js');
+const wireless = require('./pair/index.js');
 
 // ── 配置（飞牛生命周期注入；本地开发可省略）──
 const conf = {
@@ -26,6 +30,8 @@ const conf = {
   adminRequired: process.env.BOXADB_REQUIRE_ADMIN === '1',
   tunnelPort: Number(process.env.BOXADB_ALLOWED_PORT || 5555),     // 唯一放行的目标端口
   idleExitSec: Number(process.env.BRIDGE_IDLE_SECONDS || 0),       // >0：无会话 N 秒后自退
+  stateDir: process.env.TRIM_PKGVAR || path.join(os.tmpdir(), 'boxadb-fnos'),
+  pinPort: Number(process.env.BOXADB_PIN_PORT || 5555),
 };
 
 // ── WebSocket 帧编解码（按 RFC 6455 实现；服务端发出帧不加掩码）──
@@ -380,12 +386,108 @@ async function handleNasList(req, res, url) {
   } catch (e) { say(`naslist error: ${e.message}`); json(res, 502, { error: 'acl-check-failed' }); }
 }
 
+// ── 无线调试配对 / 自愈钉端口 ──
+const readBody = (req, limit = 4096) => new Promise((resolve, reject) => {
+  let n = 0; const chunks = [];
+  req.on('data', (c) => { n += c.length; if (n > limit) { reject(new Error('body too large')); req.destroy(); } else chunks.push(c); });
+  req.on('end', () => { try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}); } catch (e) { reject(new Error('bad json')); } });
+  req.on('error', reject);
+});
+const isAdmin = (req) => String(req.headers['x-trim-isadmin'] || '').toLowerCase() === 'true';
+const apiGuard = (req, res) => {
+  if (conf.adminRequired && !isAdmin(req)) { json(res, 403, { error: 'admin-only' }); return false; }
+  return true;
+};
+
+// 失败时给用户看得懂的落点：code=配对码错 / tls=钥匙过期需重配 / connect=端口没开
+const FAIL_HINT = {
+  code: '配对码不正确或已过期，请回到配对窗口重新获取',
+  pairing: '配对中断，请确认配对窗口仍停留在屏幕上',
+  'pair-tls': '连不上配对端口，请确认配对窗口是打开状态',
+  connect: '连不上连接端口，请照无线调试第一屏核对端口号',
+  handshake: '设备没有按预期应答，请确认目标 IP 是这台盒子',
+  tls: '这台设备的配对已失效，需要重新配对一次',
+  cnxn: '设备拒绝了已保存的配对，需要重新配对一次',
+  timeout: '设备响应超时，请确认盒子在线且无线调试已开启',
+  plaintext: '这台设备不需要配对，直接填 IP 连接即可',
+  'manual-port': '自动发现端口不可用：请把电视「无线调试」第一屏显示的端口填到 ① 再提交（或直接把 5555 试一次）',
+  'not-paired': '这台设备还没配过对：在电视上点开「使用配对码配对设备」，把配对端口和 6 位配对码填到 ② 再提交',
+  'no-service': '盒子重启后「无线调试」会自动关掉：用遥控器打开 设置 → 开发者选项 → 无线调试（不用再输配对码），然后重新点连接即可',
+};
+
+async function handlePair(req, res) {
+  if (!apiGuard(req, res)) return;
+  let b;
+  try { b = await readBody(req); } catch (e) { return json(res, 400, { error: e.message }); }
+  const host = String(b.host || '').trim();
+  const pairPort = Number(b.pairPort);
+  const code = String(b.code || '').trim();
+  if (!isPrivateIPv4(host)) return json(res, 400, { error: 'bad-host' });
+  if (!Number.isInteger(pairPort) || pairPort < 1 || pairPort > 65535) return json(res, 400, { error: 'bad-pair-port' });
+  if (!/^\d{6}$/.test(code)) return json(res, 400, { error: 'bad-code' });
+  let p;
+  try {
+    p = await wireless.pair({ host, port: pairPort, code });
+  } catch (e) {
+    say(`pair fail [${host}:${pairPort}] step=${e.step || 'unknown'} ${e.message}`);
+    return json(res, 400, { error: e.step || 'pairing', hint: FAIL_HINT[e.step] || e.message });
+  }
+  // 配对成功即尝试钉端口：连接端口优先用页面给的（第一屏），没给就现查 mDNS
+  let connPort = Number(b.connPort) || 0;
+  let connHost = host;
+  if (!connPort) {
+    const found = await mdns.connect(2000);
+    const hit = found.find((f) => f.instance === p.identity) || found[0];
+    if (hit) connPort = hit.port;
+  }
+  if (!connPort) return json(res, 200, { ok: true, paired: p.identity, pinned: false, need: 'conn-port' });
+  try {
+    const r = await wireless.pin({ host: connHost, port: connPort, identity: p.identity, psk: p.psk, pinPort: conf.pinPort });
+    say(`pair ok [${host}] ${p.identity} pinned=${r.pinned}`);
+    json(res, 200, { ok: true, paired: p.identity, pinned: r.pinned, pinPort: conf.pinPort, device: r.device, reply: r.text });
+  } catch (e) {
+    say(`pair pinned fail [${connHost}:${connPort}] ${e.step || ''} ${e.message}`);
+    json(res, 200, { ok: true, paired: p.identity, pinned: false, error: e.step, hint: FAIL_HINT[e.step] || e.message });
+  }
+}
+
+async function handleRecover(req, res) {
+  if (!apiGuard(req, res)) return;
+  let b = {};
+  try { b = req.method === 'POST' ? await readBody(req) : {}; } catch (e) { return json(res, 400, { error: e.message }); }
+  const host = String(b.host || '').trim();
+  if (host && !isPrivateIPv4(host)) return json(res, 400, { error: 'bad-host' });
+  const r = await wireless.recover({ host: host || undefined, pinPort: conf.pinPort });
+  say(`recover ${r.ok ? 'ok' : 'need-pair'} ${r.identity || ''} ${r.reason || ''}`);
+  if (r.ok) return json(res, 200, { ok: true, identity: r.identity, port: r.port, pinned: r.pinned, device: r.device });
+  const reason = String(r.reason || '');
+  const noService = r.need === 'manual-port';
+  const notPaired = r.need === 'pair' && (reason.includes('已存凭据') || reason === '无 psk');
+  json(res, 200, {
+    ok: false, need: noService ? 'enable-wireless' : 'pair', reason: r.reason,
+    hint: noService ? FAIL_HINT['no-service']
+      : notPaired ? FAIL_HINT['not-paired']
+      : (FAIL_HINT[r.step] || FAIL_HINT.timeout),
+  });
+}
+
+async function handleDiscover(req, res) {
+  if (!apiGuard(req, res)) return;
+  const [pairing, connect] = await Promise.all([mdns.pairing(1800), mdns.connect(1800)]);
+  const known = new Set(keystore.list().map((x) => x.instance));
+  json(res, 200, { pairing, connect: connect.map((c) => ({ ...c, paired: known.has(c.instance) })) });
+}
+
 // ── HTTP 服务 ──
 const app = http.createServer((req, res) => {
   let url;
   try { url = new URL(req.url, 'http://localhost'); }
   catch { res.writeHead(400).end('bad request'); return; }
 
+  const apiPost = `${conf.prefix}/pair`, apiRecover = `${conf.prefix}/recover`;
+  if (url.pathname === apiPost && req.method === 'POST') { handlePair(req, res); return; }
+  if (url.pathname === apiRecover && (req.method === 'POST' || req.method === 'GET')) { handleRecover(req, res); return; }
+  if (url.pathname === `${conf.prefix}/discover` && req.method === 'GET') { handleDiscover(req, res); return; }
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405).end('method not allowed');
     return;
@@ -416,6 +518,7 @@ app.on('clientError', (err, socket) => { try { socket.end('HTTP/1.1 400 Bad Requ
 const say = (...a) => console.log(new Date().toISOString(), ...a);
 
 function boot() {
+  keystore.init(conf.stateDir);
   if (conf.socketPath) {
     try { fs.rmSync(conf.socketPath, { force: true }); } catch {}
     app.listen(conf.socketPath, () => {

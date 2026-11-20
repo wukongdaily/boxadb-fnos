@@ -194,6 +194,78 @@ function wsEcho(host, targetPort) {
     '若服务自带 tls-port 则切到容器版引导（分流条件确实只看 tls-port）');
 
   echo.close();
+
+  // ── 无线调试协议层（离线断言，全部来自真机/官方 adb 实测事实）──
+  console.log('\n[无线调试协议层]');
+  {
+    const PD = path.join(__dirname, '..', 'boxadb', 'app', 'server', 'pair');
+    const w = require(PD + '/adbwire.js');
+    const fr = require(PD + '/frame.js');
+    const pi = require(PD + '/peerinfo.js');
+    const { encodeAdbPubkey } = require(PD + '/pubkey.js');
+    const md = require(PD + '/mdns.js');
+    const crypto2 = require('node:crypto');
+  
+    const cnxn = w.encode(w.CMD.CNXN, w.VERSION, w.MAXDATA, w.cstring('host::features=shell_v2,cmd'));
+    ok(w.decode(cnxn).name === 'CNXN', 'CNXN 往返');
+    const authLike = Buffer.alloc(44);
+    authLike.writeUInt32LE(w.CMD.AUTH, 0); authLike.writeUInt32LE(1, 4); authLike.writeUInt32LE(0, 8);
+    authLike.writeUInt32LE(20, 12); authLike.writeUInt32LE(0, 16); authLike.writeUInt32LE((~w.CMD.AUTH) >>> 0, 20);
+    crypto2.randomBytes(20).copy(authLike, 24);
+    const dAuth = w.decode(authLike);
+    ok(dAuth.name === 'AUTH' && dAuth.checkOk === false, '真机 AUTH(data_check=0) 不被丢弃，仅标记');
+    ok(dAuth.arg0 === 1, 'AUTH 的 method 在 arg0');
+    const bad = Buffer.from(cnxn); bad[24] ^= 0xff;
+    ok(w.decode(bad).checkOk === false, '载荷翻位可检出');
+    let thrown = false; try { const b2 = Buffer.from(cnxn); b2.writeUInt32LE(0, 20); w.decode(b2); } catch { thrown = true; }
+    ok(thrown, 'command_check(=~command) 仍严格');
+  
+    const kSpake = Object.keys(fr).find((k) => /^TYPE_/.test(k) && k !== 'TYPE_PEER_INFO');
+    ok(fr.VERSION === 1 && fr[kSpake] === 0 && fr.TYPE_PEER_INFO === 1, '帧类型常量：SPAKE2 消息=0 / PEER_INFO=1');
+    const f1 = fr.encodeFrame(fr.TYPE_PEER_INFO, Buffer.alloc(8));
+    ok(f1[0] === 1 && f1[1] === 1 && f1.readUInt32BE(2) === 8, '帧头 = ver|type|BE4 长度');
+    const r2 = new fr.Recorder(crypto2.randomBytes(16));
+    const c1 = r2.seal(fr.TYPE_PEER_INFO, Buffer.alloc(32));
+    ok(c1.length === 6 + 32 + 16, 'seal 出帧 = 6B 头 + 密文 + 16B tag');
+    ok(r2.nonces.send[0].equals(Buffer.alloc(12)) && r2.nonces.send[0].length === 12, '首帧 nonce 全零（协议本意，勿改）');
+    ok(Buffer.from(r2.nonces.send[0]).subarray(8).equals(Buffer.alloc(4)), 'nonce = 8B 小端计数 + 4B 零');
+  
+    const kp = crypto2.generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const blob = encodeAdbPubkey(kp.publicKey);
+    ok(blob.length === 524, '公钥 blob 524B');
+    ok(blob.readUInt32LE(0) === 64, 'len 字段 = 32 位字数（2048 位 → 64）');
+    const info = pi.rsaFromKey524(blob, 'boxadb@fnos');
+    ok(info.length === 8192 && info[0] === 0, 'RSA PeerInfo：8192B、type=0');
+    const back = pi.readRsa(info);
+    ok(back.key524.equals(blob) && back.user === 'boxadb@fnos', 'PeerInfo 文本 base64 往返一致（含用户名）');
+    const hint = pi.pskHint('adb-22101HFDD5AUQX-asE7Ak');
+    const parsed = pi.assertShape(hint, 'tv');
+    ok(parsed && parsed.hint === 'adb-22101HFDD5AUQX-asE7Ak', '设备侧 type=1 解析出 psk identity hint');
+    ok(pi.assertShape(info, 'self').key524.length === 524, 'assertShape 通过自身构造');
+  
+    const q = md.query(['_adb-tls-connect._tcp.local']);
+    ok(q.readUInt16BE(4) === 1 && q.subarray(-4).equals(Buffer.from([0, 12, 0, 1])) && q.length === 45,
+      'mDNS 查询：qdcount=1、尾 QTYPE=12 PTR / QCLASS=1');
+  }
+
+  
+  // ── 重启后的引导：开关自动关 ≠ 需要重新配对 ──
+  console.log('\n[重启自愈引导]');
+  {
+    const fs2 = require('node:fs');
+    const src = fs2.readFileSync(path.join(__dirname, '..', 'boxadb', 'app', 'server', 'server.js'), 'utf8');
+    const www = path.join(__dirname, '..', 'boxadb', 'app', 'www');
+    const appSrc = fs2.readFileSync(path.join(www, 'js', 'app.js'), 'utf8');
+    const html = fs2.readFileSync(path.join(www, 'index.html'), 'utf8');
+    ok(src.includes("'no-service'") && /no-service[^\n]*无线调试[^\n]*不用再输配对码/.test(src),
+      '桥把「没发现无线调试服务」翻译成"打开开关即可，不用重新配对"');
+    ok(src.includes("need: noService ? 'enable-wireless' : 'pair'"), '无服务时落点是 enable-wireless，不误判成需要配对');
+    ok(appSrc.includes("r.need === 'enable-wireless'") && appSrc.includes('needsWirelessOn('), '前端收到该落点会直接提示开开关');
+    ok(src.includes("'not-paired'") && /not-paired[^\n]*还没配过对/.test(src), '未配对的落点话说清楚（不误报成无线调试没开）');
+    ok(src.includes('reason.includes(\'已存凭据\')') || src.includes("reason.includes('已存凭据')"), '按 reason 分拣落点，不是笼统 timeout');
+    ok(html.includes('允许 USB 调试') && appSrc.includes('第一次连本页面时电视会弹'), '告知用户：浏览器首次连需在电视上点一次「允许」');
+  }
+
   console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })();
