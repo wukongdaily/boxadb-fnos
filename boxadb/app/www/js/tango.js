@@ -203,7 +203,7 @@ export function wirelessAvailable() {              // 桥是否实现了配对�
   return wirelessProbe;
 }
 export const pairWireless = (o) => api('/pair', o);
-export const recoverWireless = (host) => api('/recover', { host });
+export const recoverWireless = (host, quick) => api('/recover', quick ? { host, quick: true } : { host });
 
 export async function enableTcpip(port = DEFAULT_PORT) {
   const a = requireAdb();

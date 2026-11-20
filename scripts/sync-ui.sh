@@ -21,7 +21,7 @@ grep -qF 'meta[name="boxadb-prefix"]' "$DST/js/tango.js" || {
   echo "sync-ui: tango.js 缺少运行时前缀探测，服务端注入将无效果" >&2; exit 1; }
 
 # 给 app.js 注入飞牛专属钩子（桌面源码保持干净，只在 www 副本里加）
-python3 "$ROOT/scripts/patch-app-fnos.py" "$DST/js/app.js"
+python3 "$ROOT/scripts/patch-app-fnos.py" "$DST/js/app.js" "$DST/index.html"
 
 # 应用飞牛专属 overlay（fnos 选择器模块 + 官方 SDK）→ www/fnos（镜像同步，不用 rm）
 if [ -d "$ROOT/fnos-overlay/fnos" ]; then

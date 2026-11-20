@@ -276,3 +276,30 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(61,220,132,.16)
 .allow-wait{margin:12px 0 4px;padding:11px 13px;border-radius:10px;border:1px solid var(--accent);
   background:rgba(46,204,113,.10);color:#dff7e6;font-size:14px;line-height:1.6}
 .allow-wait .allow-sub{margin-top:4px;color:var(--muted);font-size:12.5px}
+
+
+/* hidden 属性必须真的能隐藏：任何自定义类只要设了 display，就会盖掉浏览器默认的 [hidden]{display:none}，
+   表现为「明明 hidden 却一加载就显示」。全局堵掉，省得每个组件各补一条。 */
+[hidden]{display:none!important}
+
+/* 等待类提示：比普通 toast 更大更醒目，带脉冲点与倒计时 */
+.toast.wait{border-left-color:var(--accent);background:var(--panel-2);color:#eafff1;
+  font-size:14.5px;padding:13px 16px;min-width:min(360px,80vw);display:flex;align-items:center;gap:10px;
+  box-shadow:0 10px 26px rgba(0,0,0,.42);opacity:1}
+.toast.wait .tw-dot{width:9px;height:9px;border-radius:50%;background:var(--accent);flex:0 0 auto;animation:tw-pulse 1.1s ease-in-out infinite}
+@keyframes tw-pulse{0%,100%{opacity:.3;transform:scale(.85)}50%{opacity:1;transform:scale(1.1)}}
+
+/* 全屏等待倒计时：比 toast 显眼得多，连上或取消即消失 */
+.cd-mask{position:fixed;inset:0;z-index:140;background:rgba(4,10,16,.86);backdrop-filter:blur(3px);
+  display:flex;align-items:center;justify-content:center;padding:20px}
+.cd-box{display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center}
+.cd-dial{position:relative;display:grid;place-items:center}
+.cd-ring{width:230px;height:230px;transform:rotate(-90deg)}
+.cd-ring circle{fill:none;stroke-width:8;stroke-linecap:round}
+.cd-track{stroke:#22303d}
+.cd-bar{stroke:var(--accent);stroke-dasharray:339.29;stroke-dashoffset:0;transition:stroke-dashoffset .9s linear}
+.cd-num{position:absolute;font-size:76px;font-weight:800;letter-spacing:2px;color:#eafff1;font-variant-numeric:tabular-nums}
+.cd-text{font-size:17px;font-weight:500;color:var(--muted);margin-top:4px}
+.cd-key{font-size:24px;font-weight:800;color:#eafff1;letter-spacing:1px}
+.cd-sub{font-size:13.5px;color:var(--muted)}
+.cd-box .btn{margin-top:16px}

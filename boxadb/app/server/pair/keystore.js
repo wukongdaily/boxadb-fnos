@@ -41,15 +41,36 @@ function identity() {
   return { privateKey: crypto.createPrivateKey(c.adbkeyPem), publicKey: kp.publicKey, keyPem: c.adbkeyPem, certPem: c.certPem };
 }
 
+// 必须合并写：recover 只更新 port，若整条覆盖会抹掉 pair 时写入的 peerHost，
+// 于是「这台配过对」再也认不出来，重启后又去弹配对表单
 function remember(inst, pskBuf, extra = {}) {
   const c = load();
-  c.identites[inst] = { psk: pskBuf.toString('hex'), ...extra, at: new Date().toISOString() };
+  const prev = c.identites[inst] || {};
+  const entry = { ...prev, ...extra, at: new Date().toISOString() };
+  if (pskBuf) entry.psk = Buffer.isBuffer(pskBuf) ? pskBuf.toString('hex') : String(pskBuf);
+  c.identites[inst] = entry;
   save();
 }
 const lookup = inst => load().identites[inst] || null;
+// 判定「这个 IP 是否配过对」。开关关着时设备完全不可见，只能靠本地记录，
+// 而旧版本曾把 peerHost 覆盖掉，所以这里必须容错：只有一条凭据且它没归属信息时，宁可当作配过对。
+function hintFor(host) {
+  const entries = Object.entries(load().identites);
+  const exact = entries.find(([, v]) => v.peerHost === host);
+  if (exact) return { instance: exact[0], ...exact[1] };
+  const unnamed = entries.filter(([, v]) => !v.peerHost);
+  if (entries.length === 1 && unnamed.length === 1) return { instance: unnamed[0][0], ...unnamed[0][1] };
+  return null;
+}
+
+function knownFor(host) {
+  const c = load();
+  for (const [inst, v] of Object.entries(c.identites)) if (v.peerHost === host) return { instance: inst, ...v };
+  return null;
+}
 function list() {
   const c = load();
-  return Object.entries(c.identites).map(([instance, v]) => ({ instance, port: v.port || null, at: v.at || null }));
+  return Object.entries(c.identites).map(([instance, v]) => ({ instance, port: v.port || null, at: v.at || null, peerHost: v.peerHost || null }));
 }
 function forget(inst) { delete load().identites[inst]; save(); }
 const fingerprint = () => {
@@ -58,4 +79,4 @@ const fingerprint = () => {
   try { return crypto.createHash('sha256').update(fs.readFileSync(file())).digest('hex').slice(0, 12); } catch { return null; }
 };
 
-module.exports = { init, identity, remember, lookup, list, forget, fingerprint };
+module.exports = { init, identity, remember, lookup, knownFor, hintFor, list, forget, fingerprint };

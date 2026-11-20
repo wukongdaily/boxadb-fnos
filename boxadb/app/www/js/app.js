@@ -30,6 +30,24 @@ function formatBytes(n){ const u=['B','KB','MB','GB']; let i=0; while(n>=1024&&i
 function hue(str){ let h=0; for(let i=0;i<(str||'').length;i++) h=(h*31+str.charCodeAt(i))>>>0; return `hsl(${h%360} 50% 34%)`; }
 function toast(msg, kind='info', ms=2800){ const el=document.createElement('div'); el.className='toast'+(kind!=='info'?' '+kind:''); el.textContent=msg; $('#toasts').appendChild(el); setTimeout(()=>{el.style.opacity='0';el.style.transition='opacity .2s';},ms-200); setTimeout(()=>el.remove(),ms); }
 
+// 全屏等待倒计时：大圆环 + 秒数 + 文案；连上、取消或超时即收
+const CD_LEN = 339.29;                       // 2πr，r=54
+function showCountdown(totalSec, lines, onCancel) {
+  const mask = $('#pair-countdown'); if (!mask) return { close: () => {}, left: () => 0 };
+  const ta = $('#cd-text-a'), tb = $('#cd-text-b'), num = $('#cd-num'), bar = $('#cd-bar'), btn = $('#cd-cancel');
+  if (ta) ta.textContent = (lines && lines[0]) || '请在电视上打开';
+  if (tb) tb.textContent = (lines && lines[1]) || '「无线调试」开关';
+  let left = totalSec;
+  const paint = (s) => { num.textContent = String(s); bar.style.strokeDashoffset = String(CD_LEN * (1 - s / totalSec)); };
+  paint(left);
+  mask.hidden = false;
+  // 秒数由遮罩自己的心跳驱动：探测/握手再慢也不该让它定格
+  const timer = setInterval(() => { if (left > 1) { left--; paint(left); } else close(); }, 1000);
+  function close() { clearInterval(timer); mask.hidden = true; if (btn) btn.onclick = null; }
+  if (btn) btn.onclick = () => onCancel && onCancel();
+  return { close, left: () => left };
+}
+
 // ── 惰性加载传输层 ─────────────────────────────────────
 let _t = null;
 async function tango() { if (!_t) { _t = await import('./tango.js'); if (_t.getDiag) __diagGetter = () => _t.getDiag(); } return _t; }
@@ -97,22 +115,56 @@ async function doConnect() {
 }
 
 // ── 把调试端口固定回 5555：先试已存凭据自愈，不行再让用户填电视上的两屏 ──
+async function finishConnect(T, ip, msg) {
+  await T.connect({ ip, authTimeoutMs: 90000, onStall: (why) => handleStall(why, {}) });
+  state.device = await T.fetchDevice(ip); state.connected = true;
+  renderDiag();
+  toast(msg || '已连接');
+  return true;
+}
+
 async function autoRecover(ip) {
   if (!(await pairAvailable())) return false;
-  try {
-    const T = await tango();
-    const r = await T.recoverWireless(ip);
-    if (!r || !r.ok) { if (r && r.need === 'enable-wireless') needsWirelessOn(r.hint); return false; }
-  } catch { return false; }
-  try {
-    toast('检测到这台设备以前配过对，正在自动恢复…');
-    const T = await tango();
-    await T.connect({ ip });
-    state.device = await T.fetchDevice(ip); state.connected = true;
-    renderDiag();
-    toast('已自动连上，不用重新配对');
-    return true;
-  } catch { return false; }
+  let r;
+  try { r = await (await tango()).recoverWireless(ip); } catch { return false; }
+  if (r && r.ok) {
+    try { return await finishConnect(await tango(), ip, '已自动恢复端口并连上，不用重新配对'); }
+    catch { return false; }
+  }
+  // 配过对 + 没广播＝开关没开：只提示开开关并自动等，不弹 dialog（弹了用户就会去填没用的配对码）
+  if (r && r.need === 'enable-wireless') return waitWirelessOn(ip, r.hint);
+  return false;
+}
+
+const WAIT_SEC = 90;
+let waitGen = 0;
+async function waitWirelessOn(ip, hint) {
+  const my = ++waitGen;
+  let cancelled = false;
+  const ctl = showCountdown(WAIT_SEC, null, () => { cancelled = true; waitGen++; ctl.close(); });
+  const T = await tango();
+  const stopAt = Date.now() + WAIT_SEC * 1000;
+  let busy = false;
+  while (!cancelled && waitGen === my && Date.now() < stopAt) {
+    if (!busy) {
+      busy = true;
+      let r2 = null;
+      try { r2 = await T.recoverWireless(ip, true); } catch {}
+      busy = false;
+      if (cancelled || waitGen !== my) break;
+      if (r2 && r2.ok) {
+        ctl.close();
+        toast('检测到无线调试已打开，正在自动固定端口…', 'info', 2600);
+        try { return await finishConnect(T, ip, '已自动固定并连上，全程没用到配对码'); } catch { return false; }
+      }
+      if (r2 && r2.need === 'pair') { ctl.close(); return false; }   // 确实没配过对 / 凭据失效 → 才弹表单
+    }
+    await new Promise(r => setTimeout(r, 2000));   // 探测节奏 2 秒；秒数由遮罩自己的心跳走
+  }
+  ctl.close();
+  if (cancelled || waitGen !== my) return true;                    // 用户取消 / 已交给新一轮，不再多嘴
+  toast('还没检测到盒子的无线调试：确认开关已打开后，再点一次连接', 'warn', 9000);
+  return true;
 }
 
 // 桥说「没发现无线调试服务」＝十有八九是盒子刚重启，开关自己关了；这种别让用户去输配对码
@@ -122,7 +174,8 @@ function needsWirelessOn(hint) {
 }
 
 // stall 分两类：有来文＝在等你点「允许」（显示状态块，别报失败）；完全没来文＝疑似 TLS 配对端口
-function handleStall(why, { stall, m }) {
+function handleStall(why, ctx = {}) {
+  const stall = ctx.stall, m = ctx.m;
   if (why === 'await-allow') {
     const allow = $('#pair-allow');
     if (m && !m.hidden && allow) { allow.hidden = false; allow.scrollIntoView({ block: 'nearest' }); }

@@ -195,6 +195,22 @@ function wsEcho(host, targetPort) {
 
   echo.close();
 
+  // ── 页脚仓库地址：飞牛包必须指向 boxadb-fnos ──
+  console.log('\n[页脚归属]');
+  {
+    const fs3 = require('node:fs');
+    const wwwHtml = fs3.readFileSync(path.join(__dirname, '..', 'boxadb', 'app', 'www', 'index.html'), 'utf8');
+    const deskHtml = path.join(__dirname, '..', '..', 'boxadb', 'index.html');
+    ok(wwwHtml.includes('href="https://github.com/wukongdaily/boxadb-fnos"'), '飞牛包页脚指向 boxadb-fnos');
+    ok(!/href="https:\/\/github\.com\/wukongdaily\/boxadb"/.test(wwwHtml), '飞牛包里没有残留桌面版地址');
+    ok(wwwHtml.match(/boxadb-fnos/g).length === 1, '重复同步不会把链接越改越长（幂等）');
+    if (fs3.existsSync(deskHtml)) {
+      const d = fs3.readFileSync(deskHtml, 'utf8');
+      ok(d.includes('href="https://github.com/wukongdaily/boxadb"') && !d.includes('boxadb-fnos"'),
+        '桌面仓源头仍指向 boxadb（改动只落在飞牛构建期）');
+    }
+  }
+
   // ── 无线调试协议层（离线断言，全部来自真机/官方 adb 实测事实）──
   console.log('\n[无线调试协议层]');
   {
@@ -259,9 +275,27 @@ function wsEcho(host, targetPort) {
     const html = fs2.readFileSync(path.join(www, 'index.html'), 'utf8');
     ok(src.includes("'no-service'") && /no-service[^\n]*无线调试[^\n]*不用再输配对码/.test(src),
       '桥把「没发现无线调试服务」翻译成"打开开关即可，不用重新配对"');
-    ok(src.includes("need: noService ? 'enable-wireless' : 'pair'"), '无服务时落点是 enable-wireless，不误判成需要配对');
+    ok(src.includes('function recoverVerdict'), '落点判定已抽成纯函数，可单测');
+    {
+      const m = src.match(/const FAIL_HINT = \{[\s\S]*?\n\};/)[0];
+      const fn = src.match(/function recoverVerdict\([\s\S]*?\n\}/)[0];
+      const verdict = new Function(m + '\n' + fn + '\nreturn recoverVerdict;')();
+      const K = { instance: 'adb-X' };
+      const a = verdict({ r: { ok: false, need: 'manual-port', reason: '未发现无线调试广播' }, known: K });
+      ok(a.need === 'enable-wireless' && a.paired === true, '设备不可见 + 本地有记录 → 只让开无线调试开关，不弹配对表单');
+      const b = verdict({ r: { ok: false, need: 'manual-port', reason: '未发现无线调试广播' }, known: null });
+      ok(b.need === 'pair' && b.paired === false, '设备不可见 + 无记录 → 才弹配对表单');
+      const c = verdict({ r: { ok: false, need: 'pair', reason: 'TLS 建立后设备未发 CNXN', step: 'cnxn' }, known: K });
+      ok(/重新配对/.test(c.hint), '配过对但凭据真失效 → 话说清要重新配对');
+      ok(verdict({ r: { ok: true, identity: 'adb-X', pinned: true }, known: K }).ok === true, '已连上时不误发引导');
+    }
     ok(appSrc.includes("r.need === 'enable-wireless'") && appSrc.includes('needsWirelessOn('), '前端收到该落点会直接提示开开关');
     ok(src.includes("'not-paired'") && /not-paired[^\n]*还没配过对/.test(src), '未配对的落点话说清楚（不误报成无线调试没开）');
+    const pairSrc = fs2.readFileSync(path.join(__dirname, '..', 'boxadb', 'app', 'server', 'pair', 'keystore.js'), 'utf8');
+    ok(/const entry = \{ \.\.\.prev, \.\.\.extra/.test(pairSrc) && pairSrc.includes('function knownFor'),
+      'remember 合并写：recover 更新端口不会抹掉 peerHost（抹了就认不出「配过对」，会误弹 dialog）');
+    const idxSrc = fs2.readFileSync(path.join(__dirname, '..', 'boxadb', 'app', 'server', 'pair', 'index.js'), 'utf8');
+    ok(idxSrc.includes('k.peerHost === host') && idxSrc.includes('const sole = known.length === 1'), '自愈只连同 IP 的实例；无归属的旧记录仅在单设备单记录时才套用');
     ok(src.includes('reason.includes(\'已存凭据\')') || src.includes("reason.includes('已存凭据')"), '按 reason 分拣落点，不是笼统 timeout');
     ok(html.includes('允许 USB 调试') && appSrc.includes('第一次连本页面时电视会弹'), '告知用户：浏览器首次连需在电视上点一次「允许」');
   }

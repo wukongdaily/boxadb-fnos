@@ -201,7 +201,7 @@
   </main>
 
   <footer class="foot">
-    <a class="foot-link" href="https://github.com/wukongdaily/boxadb" target="_blank" rel="noopener">盒子助手 BoxADB 悟空的日常</a>
+    <a class="foot-link" href="https://github.com/wukongdaily/boxadb-fnos" target="_blank" rel="noopener">盒子助手 BoxADB 悟空的日常</a>
   </footer>
 
   <!-- 非加密访问引导弹窗（浏览器禁止 http 页面生成 ADB 密钥）-->
@@ -282,6 +282,23 @@
 
   <!-- 仅 URL 带 ?diag=1 时由 app.js 显示：把连不上的原因分类，便于远程定位机型问题 -->
   <pre id="diag" hidden></pre>
+
+  <!-- 等待用户打开「无线调试」：全屏倒计时，连上即收 -->
+  <div id="pair-countdown" class="cd-mask" hidden>
+    <div class="cd-box">
+      <div class="cd-dial">
+        <svg class="cd-ring" viewBox="0 0 120 120" aria-hidden="true">
+          <circle class="cd-track" cx="60" cy="60" r="54"></circle>
+          <circle class="cd-bar" id="cd-bar" cx="60" cy="60" r="54"></circle>
+        </svg>
+        <div class="cd-num" id="cd-num">90</div>
+      </div>
+      <div class="cd-text" id="cd-text-a">请在电视上打开</div>
+      <div class="cd-key" id="cd-text-b">「无线调试」开关</div>
+      <div class="cd-sub">打开后我会自动连接，不需要再输配对码</div>
+      <button id="cd-cancel" class="btn subtle" type="button">取消等待</button>
+    </div>
+  </div>
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
 

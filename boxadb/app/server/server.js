@@ -451,24 +451,30 @@ async function handlePair(req, res) {
   }
 }
 
+// 落点判定：设备不可见时，唯一依据是本地记录；有记录就只让他开开关，别让他去填用不上的配对码
+function recoverVerdict({ r, known }) {
+  if (r.ok) return { ok: true, identity: r.identity, port: r.port, pinned: r.pinned, device: r.device, paired: true };
+  const reason = String(r.reason || '');
+  const noService = r.need === 'manual-port' || reason.includes('未发现') || reason.includes('不可见');
+  if (noService && known) return { ok: false, need: 'enable-wireless', paired: true, identity: known.instance, hint: FAIL_HINT['no-service'] };
+  if (noService) return { ok: false, need: 'pair', paired: false, reason: r.reason, hint: FAIL_HINT['not-paired'] };
+  const notPaired = reason.includes('已存凭据') || reason === '无 psk';
+  return { ok: false, need: 'pair', paired: !!known, reason: r.reason,
+    hint: notPaired ? FAIL_HINT['not-paired'] : (FAIL_HINT[r.step] || FAIL_HINT.timeout) };
+}
+
 async function handleRecover(req, res) {
   if (!apiGuard(req, res)) return;
   let b = {};
   try { b = req.method === 'POST' ? await readBody(req) : {}; } catch (e) { return json(res, 400, { error: e.message }); }
   const host = String(b.host || '').trim();
   if (host && !isPrivateIPv4(host)) return json(res, 400, { error: 'bad-host' });
-  const r = await wireless.recover({ host: host || undefined, pinPort: conf.pinPort });
-  say(`recover ${r.ok ? 'ok' : 'need-pair'} ${r.identity || ''} ${r.reason || ''}`);
-  if (r.ok) return json(res, 200, { ok: true, identity: r.identity, port: r.port, pinned: r.pinned, device: r.device });
-  const reason = String(r.reason || '');
-  const noService = r.need === 'manual-port';
-  const notPaired = r.need === 'pair' && (reason.includes('已存凭据') || reason === '无 psk');
-  json(res, 200, {
-    ok: false, need: noService ? 'enable-wireless' : 'pair', reason: r.reason,
-    hint: noService ? FAIL_HINT['no-service']
-      : notPaired ? FAIL_HINT['not-paired']
-      : (FAIL_HINT[r.step] || FAIL_HINT.timeout),
-  });
+  const known = host ? keystore.hintFor(host) : null;
+  const quick = b.quick === true;   // 等待循环用短窗口，才能 2 秒一轮而不叠加
+  const r = await wireless.recover({ host: host || undefined, pinPort: conf.pinPort, mdnsMs: quick ? 900 : 2000 });
+  say(`recover ${r.ok ? 'ok' : (r.need || '?')} ${r.identity || ''} ${r.reason || ''}`);
+  if (r.ok) return json(res, 200, { ok: true, identity: r.identity, port: r.port, pinned: r.pinned, device: r.device, paired: true });
+  json(res, 200, recoverVerdict({ r, known }));
 }
 
 async function handleDiscover(req, res) {
@@ -477,6 +483,8 @@ async function handleDiscover(req, res) {
   const known = new Set(keystore.list().map((x) => x.instance));
   json(res, 200, { pairing, connect: connect.map((c) => ({ ...c, paired: known.has(c.instance) })) });
 }
+
+exports.recoverVerdict = recoverVerdict;   // 供回归测试直接验落点
 
 // ── HTTP 服务 ──
 const app = http.createServer((req, res) => {

@@ -122,19 +122,21 @@ async function pin({ host, port, identity, psk, pinPort = 5555, timeout = 8000 }
 }
 
 // 自愈：现查 mDNS（端口每次开机都变）→ 用已存 psk 开门钉端口
-async function recover({ host, pinPort = 5555, timeout = 8000 } = {}) {
-  if (host && await probe(host, pinPort, 1500)) return { ok: true, already: true, pinPort };   // 端口已通，无需任何自愈
-  const found = await mdns.connect(2000);
+async function recover({ host, pinPort = 5555, timeout = 8000, mdnsMs = 2000 } = {}) {
+  if (host && await probe(host, pinPort, 1200)) return { ok: true, already: true, pinPort };   // 端口已通，无需任何自愈
+  const found = await mdns.connect(mdnsMs);
   const known = ks.list();
-  const hit = found.find(f => known.some(k => k.instance === f.instance)) ||
-    (found.length === 1 && known.some(k => k.instance === found[0].instance) ? found[0] : null);
+  // 只认「配过对且属于这台 IP」的实例；无归属信息的旧记录仅在当地只有一条凭据时才敢套用
+  const sole = known.length === 1 && found.length === 1;
+  const hit = found.find((f) => known.some((k) => k.instance === f.instance &&
+    (!host || !k.peerHost ? (k.peerHost ? k.peerHost === host : sole) : k.peerHost === host)));
   if (!hit) return { ok: false, need: found.length ? 'pair' : 'manual-port', discovered: found,
     reason: found.length ? '发现的实例没有已存凭据' : '未发现无线调试广播（可能是自动发现不可用，也可能开关确实没开）' };
   const rec = ks.lookup(hit.instance);
   if (!rec || !rec.psk) return { ok: false, need: 'pair', reason: '无 psk' };
   try {
     const r = await pin({ host, port: hit.port, identity: hit.instance, psk: rec.psk, pinPort, timeout });
-    ks.remember(hit.instance, Buffer.from(rec.psk, 'hex'), { port: hit.port });
+    ks.remember(hit.instance, Buffer.from(rec.psk, 'hex'), { port: hit.port, peerHost: host });   // 顺手补回归属，旧记录会被逐步修好
     return { ok: true, identity: hit.instance, port: hit.port, ...r };
   } catch (e) {
     return { ok: false, need: 'pair', step: e.step, reason: e.message, identity: hit.instance };
