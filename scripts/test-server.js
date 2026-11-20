@@ -10,7 +10,7 @@ const fs = require('node:fs');
 const SERVER = path.join(__dirname, '..', 'boxadb', 'app', 'server', 'server.js');
 const PORT = 8899;
 const PREFIX = '/app/boxadb';
-let pass = 0, fail = 0;
+let pass = 0, fail = 0, skipped = 0;
 const ok = (cond, name) => { if (cond) { pass++; console.log('  ✓', name); } else { fail++; console.log('  ✗', name); } };
 
 const req = (p, method = 'GET') => new Promise((res) => {
@@ -208,6 +208,8 @@ function wsEcho(host, targetPort) {
       const d = fs3.readFileSync(deskHtml, 'utf8');
       ok(d.includes('href="https://github.com/wukongdaily/boxadb"') && !d.includes('boxadb-fnos"'),
         '桌面仓源头仍指向 boxadb（改动只落在飞牛构建期）');
+    } else {
+      skipped++; console.log('  ⚠ 跳过：桌面仓源头仍指向 boxadb（无同级 ../boxadb，独立克隆下不可判定）');
     }
   }
 
@@ -305,6 +307,6 @@ function wsEcho(host, targetPort) {
     ok(html.includes('允许 USB 调试') && appSrc.includes('第一次连本页面时电视会弹'), '告知用户：浏览器首次连需在电视上点一次「允许」');
   }
 
-  console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
+  console.log(`\n结果: ${pass} 通过 / ${fail} 失败` + (skipped ? ` / ${skipped} 跳过（原因见上）` : ''));
   process.exit(fail ? 1 : 0);
 })();
