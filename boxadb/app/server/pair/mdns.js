@@ -130,4 +130,20 @@ async function browse(service, ms = 1500) {
 }
 const pairing = ms => browse(PAIRING, ms);
 const connect = ms => browse(CONNECT, ms);
-module.exports = { pairing, connect, browse, parse, query: (n) => buildQuery(n, false) };
+// 能否在本机发现 mDNS 广播：判据是「有没有和目标同一 /24 的网口」。
+// NAT 容器里只有容器内网段（如 172.17/192.168.215），组播到不了局域网；NAS 版跑在主机上则同段可用。
+function discoverable(host) {
+  if (!host) {
+    for (const addrs of Object.values(os.networkInterfaces())) {
+      for (const a of addrs || []) if (a.family === 'IPv4' && !a.internal && !a.address.startsWith('127.')) return true;
+    }
+    return false;
+  }
+  const want = String(host).split('.').slice(0, 3).join('.');
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    for (const a of addrs || []) if (a.family === 'IPv4' && !a.internal && a.address.split('.').slice(0, 3).join('.') === want) return true;
+  }
+  return false;
+}
+
+module.exports = { pairing, connect, browse, parse, query: (n) => buildQuery(n, false), discoverable };

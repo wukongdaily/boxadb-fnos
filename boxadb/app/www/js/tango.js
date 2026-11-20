@@ -195,11 +195,12 @@ async function api(path, body) {
   if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
   return d;
 }
-export const discoverWireless = () => api('/discover');
+export const discoverWireless = (host) => api('/discover' + (host ? '?host=' + encodeURIComponent(host) : ''));
 let wirelessProbe = null;
-export function wirelessAvailable() {              // 桥是否实现了配对接口（Go 桥没有 → 界面不出配对口）
+export function wirelessAvailable() {              // 桥是否真的实现了配对接口（Go 桥没有 → 界面不出配对口）
   if (!selfHosted) return Promise.resolve(false);
-  if (!wirelessProbe) wirelessProbe = discoverWireless().then(() => true).catch(() => false);
+  // 必须看到「发现结果的样子」才算支持：只看「没报错」会被 SPA 兜底（200 + index.html）骗出死控件
+  if (!wirelessProbe) wirelessProbe = discoverWireless().then((d) => !!(d && Array.isArray(d.connect))).catch(() => false);
   return wirelessProbe;
 }
 export const pairWireless = (o) => api('/pair', o);

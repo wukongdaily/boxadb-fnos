@@ -20,6 +20,11 @@ diff -q "$SRC/js/tango.js" "$DST/js/tango.js" >/dev/null || {
 grep -qF 'meta[name="boxadb-prefix"]' "$DST/js/tango.js" || {
   echo "sync-ui: tango.js 缺少运行时前缀探测，服务端注入将无效果" >&2; exit 1; }
 
+# 无线配对模块：唯一真源在桌面仓 boxadb/pair（Docker 与飞牛共用同一份，禁止两处各存一份）
+mkdir -p "$PKG/app/server/pair"
+rsync -a --delete "$SRC/pair/" "$PKG/app/server/pair/"
+diff -rq "$SRC/pair" "$PKG/app/server/pair" >/dev/null || { echo "sync-ui: pair/ 同步不一致" >&2; exit 1; }
+
 # 给 app.js 注入飞牛专属钩子（桌面源码保持干净，只在 www 副本里加）
 python3 "$ROOT/scripts/patch-app-fnos.py" "$DST/js/app.js" "$DST/index.html"
 

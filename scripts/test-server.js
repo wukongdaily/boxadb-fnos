@@ -269,12 +269,16 @@ function wsEcho(host, targetPort) {
   console.log('\n[重启自愈引导]');
   {
     const fs2 = require('node:fs');
-    const src = fs2.readFileSync(path.join(__dirname, '..', 'boxadb', 'app', 'server', 'server.js'), 'utf8');
+    const src = fs2.readFileSync(path.join(__dirname, '..', 'boxadb', 'app', 'server', 'pair', 'api.js'), 'utf8')
+      + fs2.readFileSync(path.join(__dirname, '..', 'boxadb', 'app', 'server', 'server.js'), 'utf8');
     const www = path.join(__dirname, '..', 'boxadb', 'app', 'www');
     const appSrc = fs2.readFileSync(path.join(www, 'js', 'app.js'), 'utf8');
     const html = fs2.readFileSync(path.join(www, 'index.html'), 'utf8');
     ok(src.includes("'no-service'") && /no-service[^\n]*无线调试[^\n]*不用再输配对码/.test(src),
       '桥把「没发现无线调试服务」翻译成"打开开关即可，不用重新配对"');
+    ok(fs2.readFileSync(path.join(__dirname, '..', 'boxadb', 'app', 'server', 'pair', 'api.js'), 'utf8').length > 0
+       && !fs2.readFileSync(path.join(__dirname, '..', 'boxadb', 'app', 'server', 'server.js'), 'utf8').includes('const FAIL_HINT'),
+      '中文话术只有一份（在 pair/api.js），server.js 不再自带第二套');
     ok(src.includes('function recoverVerdict'), '落点判定已抽成纯函数，可单测');
     {
       const m = src.match(/const FAIL_HINT = \{[\s\S]*?\n\};/)[0];
@@ -284,7 +288,8 @@ function wsEcho(host, targetPort) {
       const a = verdict({ r: { ok: false, need: 'manual-port', reason: '未发现无线调试广播' }, known: K });
       ok(a.need === 'enable-wireless' && a.paired === true, '设备不可见 + 本地有记录 → 只让开无线调试开关，不弹配对表单');
       const b = verdict({ r: { ok: false, need: 'manual-port', reason: '未发现无线调试广播' }, known: null });
-      ok(b.need === 'pair' && b.paired === false, '设备不可见 + 无记录 → 才弹配对表单');
+      ok(b.need === 'manual-port' && /容器网络隔离/.test(b.hint),
+        '设备不可见 + 无记录 → 说"可能开关没开或容器查不到"并给手填出口，不逼用户去配对');
       const c = verdict({ r: { ok: false, need: 'pair', reason: 'TLS 建立后设备未发 CNXN', step: 'cnxn' }, known: K });
       ok(/重新配对/.test(c.hint), '配过对但凭据真失效 → 话说清要重新配对');
       ok(verdict({ r: { ok: true, identity: 'adb-X', pinned: true }, known: K }).ok === true, '已连上时不误发引导');

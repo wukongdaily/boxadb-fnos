@@ -35,7 +35,7 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 [ -n "$ROOT" ] || { echo "错误：当前不在 git 仓库内，请在 boxadb-fnos 仓库目录运行本脚本。" >&2; exit 1; }
 APP_DIR="$ROOT/boxadb"                       # fnpack 项目目录
 REL_MANIFEST="boxadb/manifest"               # 相对 git 根
-# --directory 默认就是 "."，APP_DIR 本身即应用源码目录；曾误传 "boxadb" 导致 fnpack 失败（详见 3/7 注释）
+# --directory 默认就是 "."，APP_DIR 本身即应用源码目录；曾误传 "boxadb" 导致 fnpack 失败（详见 4/8 注释）
 FPK_NAME="boxadb.fpk"                        # fnpack 固定产出名
 OUT_DIR="$(cd "$ROOT/.." && pwd)/outputs"    # fpk 交付目录
 REPO_DEFAULT="wukongdaily/boxadb-fnos"
@@ -82,7 +82,7 @@ die()  { printf '\033[1;31m错误：\033[0m %s\n' "$*" >&2; exit 1; }
 run()  { if [ "$DRY" = 1 ]; then printf '    [dry-run] %s\n' "$*"; else "$@"; fi; }
 
 # ── 环境检查 ──────────────────────────────────────────────────
-say "1/7 检查环境"
+say "1/8 检查环境"
 [ -d "$APP_DIR" ] || die "找不到项目目录 $APP_DIR"
 
 FNPACK="${FNPACK:-}"
@@ -126,11 +126,22 @@ if [ "$BUILD_ONLY" != 1 ] && [ "$DRY" != 1 ]; then
 fi
 
 # ── 2) 把源码 manifest 的 version 改成目标（供 build 读取）──────
-say "2/7 设定版本号 version=$VER（$CUR_VER → $VER）"
+say "2/8 设定版本号 version=$VER（$CUR_VER → $VER）"
 if [ "$DRY" = 1 ]; then
   printf '    [dry-run] 将 manifest 内 version 设为 %s 后 build\n' "$VER"
 else
   sed -i '' "s/^version=.*/version=$VER/" "$APP_DIR/manifest"
+fi
+
+# ── 3) 同步产物必须来自共享仓真源（www + pair）───────────────────
+# pair/ 与 www/ 是同步产物而非本仓手写副本：不在出包前同步，全新克隆出的
+# fpk 就缺 13 个配对模块，装上后 server.js 直接起不来。sync-ui.sh 自带逐字节
+# 一致性断言，上游缺失或不一致都会非零退出，所以这是硬闸。
+say "3/8 同步 UI 与配对模块（真源 = ../boxadb）"
+if [ "$DRY" = 1 ]; then
+  printf '    [dry-run] 将执行：bash scripts/sync-ui.sh\n'
+else
+  bash "$ROOT/scripts/sync-ui.sh" | sed 's/^/    /'
 fi
 
 # ── 3) fnpack build 正规出包 ───────────────────────────────────
@@ -138,7 +149,7 @@ fi
 # 且 build 前工作区若残留上一次的 boxadb.fpk，旧的「文件是否存在」判断会被残留满足，
 # 于是把上一版包当成本次产物交付（SHA-256 与上一版完全相同）。故此处三重防线缺一不可：
 #   ① build 前清残留  ② 按日志关键字判成败  ③ 出包后校验版本与前端字节一致性
-say "3/7 fnpack build"
+say "4/8 fnpack build"
 if [ "$DRY" = 1 ]; then
   printf '    [dry-run] cd "%s" && "%s" build\n' "$APP_DIR" "$FNPACK"
   DRY_FPK="$OUT_DIR/boxadb-$VER.fpk"
@@ -179,7 +190,7 @@ else
 fi
 
 # ── 4) 还原源码 manifest 为「干净版」（只 version 一行变化）───────
-say "4/7 还原源码 manifest 为干净版（剔除 fnpack 注入的对齐+checksum）"
+say "5/8 还原源码 manifest 为干净版（剔除 fnpack 注入的对齐+checksum）"
 if [ "$DRY" = 1 ]; then
   printf '    [dry-run] 取 HEAD 的紧凑版 manifest，仅把 version 改为 %s\n' "$VER"
 else
@@ -198,7 +209,7 @@ else
 fi
 
 # ── 5) 预览将要提交的内容 + 确认门 ─────────────────────────────
-say "5/7 预览待提交内容"
+say "6/8 预览待提交内容"
 [ "$DRY" = 1 ] && { warn "dry-run：跳过实际 git diff"; } || {
   echo "   相对 HEAD 的改动（--stat）:"
   git --no-pager diff --stat HEAD | sed 's/^/     /'
@@ -228,7 +239,7 @@ if [ "$ASSUME_YES" != 1 ]; then
 fi
 
 # ── 6) commit + tag ────────────────────────────────────────────
-say "6/7 提交 + 打 tag"
+say "7/8 提交 + 打 tag"
 git add -A
 if git diff --cached --quiet; then
   warn "暂存区无变化（manifest 版本号可能已是 $VER 且无其它改动）——若确要空发本次 tag，去掉该保护手动操作。"
@@ -253,7 +264,7 @@ push_retry() {  # 用法: push_retry <ref>
   die "push $ref 连续 5 次失败，最后错误：$(cat /tmp/boxadb-push.err)"
 }
 
-say "7/7 推送 + 发布 Release"
+say "8/8 推送 + 发布 Release"
 git pull --rebase origin main || warn "pull --rebase 未成功（可能无上游改动），继续尝试推送"
 push_retry "main"
 push_retry "v$VER"

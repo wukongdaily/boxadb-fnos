@@ -20,6 +20,7 @@ const crypto = require('node:crypto');
 const mdns = require('./pair/mdns.js');
 const keystore = require('./pair/keystore.js');
 const wireless = require('./pair/index.js');
+const pairApi = require('./pair/api.js');
 
 // ── 配置（飞牛生命周期注入；本地开发可省略）──
 const conf = {
@@ -399,92 +400,30 @@ const apiGuard = (req, res) => {
   return true;
 };
 
-// 失败时给用户看得懂的落点：code=配对码错 / tls=钥匙过期需重配 / connect=端口没开
-const FAIL_HINT = {
-  code: '配对码不正确或已过期，请回到配对窗口重新获取',
-  pairing: '配对中断，请确认配对窗口仍停留在屏幕上',
-  'pair-tls': '连不上配对端口，请确认配对窗口是打开状态',
-  connect: '连不上连接端口，请照无线调试第一屏核对端口号',
-  handshake: '设备没有按预期应答，请确认目标 IP 是这台盒子',
-  tls: '这台设备的配对已失效，需要重新配对一次',
-  cnxn: '设备拒绝了已保存的配对，需要重新配对一次',
-  timeout: '设备响应超时，请确认盒子在线且无线调试已开启',
-  plaintext: '这台设备不需要配对，直接填 IP 连接即可',
-  'manual-port': '自动发现端口不可用：请把电视「无线调试」第一屏显示的端口填到 ① 再提交（或直接把 5555 试一次）',
-  'not-paired': '这台设备还没配过对：在电视上点开「使用配对码配对设备」，把配对端口和 6 位配对码填到 ② 再提交',
-  'no-service': '盒子重启后「无线调试」会自动关掉：用遥控器打开 设置 → 开发者选项 → 无线调试（不用再输配对码），然后重新点连接即可',
-};
-
 async function handlePair(req, res) {
   if (!apiGuard(req, res)) return;
   let b;
   try { b = await readBody(req); } catch (e) { return json(res, 400, { error: e.message }); }
-  const host = String(b.host || '').trim();
-  const pairPort = Number(b.pairPort);
-  const code = String(b.code || '').trim();
-  if (!isPrivateIPv4(host)) return json(res, 400, { error: 'bad-host' });
-  if (!Number.isInteger(pairPort) || pairPort < 1 || pairPort > 65535) return json(res, 400, { error: 'bad-pair-port' });
-  if (!/^\d{6}$/.test(code)) return json(res, 400, { error: 'bad-code' });
-  let p;
-  try {
-    p = await wireless.pair({ host, port: pairPort, code });
-  } catch (e) {
-    say(`pair fail [${host}:${pairPort}] step=${e.step || 'unknown'} ${e.message}`);
-    return json(res, 400, { error: e.step || 'pairing', hint: FAIL_HINT[e.step] || e.message });
-  }
-  // 配对成功即尝试钉端口：连接端口优先用页面给的（第一屏），没给就现查 mDNS
-  let connPort = Number(b.connPort) || 0;
-  let connHost = host;
-  if (!connPort) {
-    const found = await mdns.connect(2000);
-    const hit = found.find((f) => f.instance === p.identity) || found[0];
-    if (hit) connPort = hit.port;
-  }
-  if (!connPort) return json(res, 200, { ok: true, paired: p.identity, pinned: false, need: 'conn-port' });
-  try {
-    const r = await wireless.pin({ host: connHost, port: connPort, identity: p.identity, psk: p.psk, pinPort: conf.pinPort });
-    say(`pair ok [${host}] ${p.identity} pinned=${r.pinned}`);
-    json(res, 200, { ok: true, paired: p.identity, pinned: r.pinned, pinPort: conf.pinPort, device: r.device, reply: r.text });
-  } catch (e) {
-    say(`pair pinned fail [${connHost}:${connPort}] ${e.step || ''} ${e.message}`);
-    json(res, 200, { ok: true, paired: p.identity, pinned: false, error: e.step, hint: FAIL_HINT[e.step] || e.message });
-  }
-}
-
-// 落点判定：设备不可见时，唯一依据是本地记录；有记录就只让他开开关，别让他去填用不上的配对码
-function recoverVerdict({ r, known }) {
-  if (r.ok) return { ok: true, identity: r.identity, port: r.port, pinned: r.pinned, device: r.device, paired: true };
-  const reason = String(r.reason || '');
-  const noService = r.need === 'manual-port' || reason.includes('未发现') || reason.includes('不可见');
-  if (noService && known) return { ok: false, need: 'enable-wireless', paired: true, identity: known.instance, hint: FAIL_HINT['no-service'] };
-  if (noService) return { ok: false, need: 'pair', paired: false, reason: r.reason, hint: FAIL_HINT['not-paired'] };
-  const notPaired = reason.includes('已存凭据') || reason === '无 psk';
-  return { ok: false, need: 'pair', paired: !!known, reason: r.reason,
-    hint: notPaired ? FAIL_HINT['not-paired'] : (FAIL_HINT[r.step] || FAIL_HINT.timeout) };
+  const r = await pairApi.pairFlow({ host: String(b.host || '').trim(), pairPort: b.pairPort, code: b.code, connPort: b.connPort, pinPort: conf.pinPort, log: say });
+  json(res, r.status, r.body);
 }
 
 async function handleRecover(req, res) {
   if (!apiGuard(req, res)) return;
   let b = {};
   try { b = req.method === 'POST' ? await readBody(req) : {}; } catch (e) { return json(res, 400, { error: e.message }); }
-  const host = String(b.host || '').trim();
-  if (host && !isPrivateIPv4(host)) return json(res, 400, { error: 'bad-host' });
-  const known = host ? keystore.hintFor(host) : null;
-  const quick = b.quick === true;   // 等待循环用短窗口，才能 2 秒一轮而不叠加
-  const r = await wireless.recover({ host: host || undefined, pinPort: conf.pinPort, mdnsMs: quick ? 900 : 2000 });
-  say(`recover ${r.ok ? 'ok' : (r.need || '?')} ${r.identity || ''} ${r.reason || ''}`);
-  if (r.ok) return json(res, 200, { ok: true, identity: r.identity, port: r.port, pinned: r.pinned, device: r.device, paired: true });
-  json(res, 200, recoverVerdict({ r, known }));
+  const host = String(b.host || url_q(req, 'host') || '').trim();
+  const r = await pairApi.recoverFlow({ host, quick: b.quick === true, pinPort: conf.pinPort, log: say });
+  json(res, r.status, r.body);
 }
 
 async function handleDiscover(req, res) {
   if (!apiGuard(req, res)) return;
-  const [pairing, connect] = await Promise.all([mdns.pairing(1800), mdns.connect(1800)]);
-  const known = new Set(keystore.list().map((x) => x.instance));
-  json(res, 200, { pairing, connect: connect.map((c) => ({ ...c, paired: known.has(c.instance) })) });
+  const r = await pairApi.discoverFlow({ host: url_q(req, 'host') });
+  json(res, r.status, r.body);
 }
 
-exports.recoverVerdict = recoverVerdict;   // 供回归测试直接验落点
+const url_q = (req, k) => { try { return new URL(req.url, 'http://x').searchParams.get(k) || ''; } catch { return ''; } };
 
 // ── HTTP 服务 ──
 const app = http.createServer((req, res) => {

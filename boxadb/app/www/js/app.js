@@ -131,8 +131,8 @@ async function autoRecover(ip) {
     try { return await finishConnect(await tango(), ip, '已自动恢复端口并连上，不用重新配对'); }
     catch { return false; }
   }
-  // 配过对 + 没广播＝开关没开：只提示开开关并自动等，不弹 dialog（弹了用户就会去填没用的配对码）
   if (r && r.need === 'enable-wireless') return waitWirelessOn(ip, r.hint);
+  lastRecover = r && r.need === 'manual-port' ? r : null;
   return false;
 }
 
@@ -187,6 +187,7 @@ function handleStall(why, ctx = {}) {
 }
 
 let pairCap = null;
+let lastRecover = null;   // 容器等查不到广播的环境：把「请填连接端口」带到弹窗上
 async function pairAvailable() {
   if (!SELF_HOSTED) return false;
   if (pairCap === null) { try { pairCap = await (await tango()).wirelessAvailable(); } catch { pairCap = false; } }
@@ -201,14 +202,22 @@ async function showPortDialog(ip, reason){
   const pg=$('#pair-group'), det=$('#port-detect'), note=$('#pair-note');
   const canPair = await pairAvailable();
   if (pg) pg.hidden = !canPair;
-  if (det) det.hidden = !canPair;
   if (note) note.hidden = !canPair;
-  if(title) title.textContent = reason === 'NEED_PORT' ? '这个端口不接受明文连接，需要配对' : '这台设备的 5555 端口没有反应';
-  if(desc) desc.innerHTML = reason === 'NEED_PORT'
-    ? '端口上确实有服务，但它是安卓 11+「无线调试」的加密端口。把<b>第二屏</b>的配对端口和 6 位配对码填到 ②，我配完对会<b>自动固定成 5555</b>；以后重启也只要开着无线调试就行。'
-    : '多数是重启后调试端口变成了随机值（安卓 11 以上的电视常见）。填 ① 就能连；要是提示需要配对，再补 ②。我连上后会<b>自动固定成 5555</b>，以后只填 IP 就能连。';
+  let disc = null;
+  if (canPair) { try { disc = await (await tango()).discoverWireless(ip); } catch { disc = null; } }
+  // NAT 容器里查不到广播：这个按钮只会让人白点，直接不显示
+  if (det) det.hidden = !canPair || (disc ? disc.discoverable === false : false);
+  if(title) title.textContent = reason !== 'NEED_PORT' ? '这台设备的 5555 端口没有反应'
+    : (canPair ? '这个端口不接受明文连接，需要配对' : '这个端口只接受加密连接');
+  if (desc && lastRecover && lastRecover.hint) desc.innerHTML = lastRecover.hint;
+  else if(desc) desc.innerHTML = reason !== 'NEED_PORT'
+    ? '多数是重启后调试端口变成了随机值（安卓 11 以上的电视常见）。填 ① 就能连；要是提示需要配对，再补 ②。我连上后会<b>自动固定成 5555</b>，以后只填 IP 就能连。'
+    : (canPair
+        ? '端口上确实有服务，但它是安卓 11+「无线调试」的加密端口。把<b>第二屏</b>的配对端口和 6 位配对码填到 ②，我配完对会<b>自动固定成 5555</b>；以后重启也只要开着无线调试就行。'
+        : '端口上确实有服务，但它是安卓 11+「无线调试」的加密端口，明文进不去。<b>当前这个版本（连的是本机/容器里的桥）还不能配对</b>：请先用电脑执行一次 <code>adb tcpip 5555</code> 把盒子端口固定下来，之后回到这里只填 IP 就能连。');
   if(hint) hint.textContent = ip;
   if(inp) inp.value = (state.prefs.ports && state.prefs.ports[ip]) || '';
+  if (disc && disc.lastPort && inp && !inp.value) inp.value = String(disc.lastPort);
   if(pinp) pinp.value = '';
   if(cinp) cinp.value = '';
   if(ok) ok.textContent = canPair ? '连接并固定端口' : '连接并固定端口';
@@ -221,11 +230,12 @@ async function showPortDialog(ip, reason){
   if(det) det.onclick=async ()=>{
     det.disabled=true; const t0=det.textContent; det.textContent='查找中…';
     try{
-      const T=await tango(); const d=await T.discoverWireless();
+      const T=await tango(); const d=await T.discoverWireless((state.ip || $('#device-ip').value || '').trim());
       const c=(d.connect||[])[0], pp=(d.pairing||[])[0];
       if(c&&inp&&!inp.value) inp.value=c.port;
       if(pp&&pinp) pinp.value=pp.port;
       toast(c ? `已自动填入：连接端口 ${c.port}${pp ? '、配对端口 ' + pp.port : ''}${c.paired ? '（这台配过对，② 留空即可）' : ''}` : '没查到无线调试广播：请确认电视上「无线调试」已打开，或手填端口');
+      if (disc && disc.discoverable === false) toast('当前网络环境查不到局域网广播，请手填端口', 'warn', 6000);
     }catch(e){ toast('自动查找失败：'+(e&&e.message||e),'err',6000); }
     finally{ det.disabled=false; det.textContent=t0; }
   };
