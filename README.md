@@ -35,3 +35,11 @@
 ## 许可
 
 [MIT](LICENSE)
+
+
+## ❤️ 想支持作者 ☕️
+<a href="https://wkdaily.cpolar.top/01" target="_blank">
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png"
+       alt="Buy Me A Coffee"
+       style="width:15%; height:auto;">
+</a>
