@@ -206,7 +206,7 @@ async function showPortDialog(ip, reason){
   let disc = null;
   if (canPair) { try { disc = await (await tango()).discoverWireless(ip); } catch { disc = null; } }
   // NAT 容器里查不到广播：这个按钮只会让人白点，直接不显示
-  if (det) det.hidden = !canPair || (disc ? disc.discoverable === false : false);
+  if (det) det.hidden = !canPair;
   if(title) title.textContent = reason !== 'NEED_PORT' ? '这台设备的 5555 端口没有反应'
     : (canPair ? '这个端口不接受明文连接，需要配对' : '这个端口只接受加密连接');
   if (desc && lastRecover && lastRecover.hint) desc.innerHTML = lastRecover.hint;
